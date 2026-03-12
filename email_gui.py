@@ -62,6 +62,15 @@ class MailerApp:
         self._poll_logs()
         self.root.after(1200, self._check_for_updates)
 
+    def _set_status_async(self, value: str) -> None:
+        self.root.after(0, lambda: self.status_var.set(value))
+
+    def _set_cloud_status_async(self, value: str) -> None:
+        self.root.after(0, lambda: self.cloud_status_var.set(value))
+
+    def _set_update_status_async(self, value: str) -> None:
+        self.root.after(0, lambda: self.update_status_var.set(value))
+
     def _sanitize_filename_part(self, text: str) -> str:
         value = re.sub(r"[^\w\-\.]+", "_", text.strip(), flags=re.UNICODE).strip("._")
         return value[:80] if value else "run"
@@ -550,13 +559,13 @@ class MailerApp:
                     self.log_queue.put(f"[Cloud] Вывод инициализации:\n{trimmed}\n")
                 self.log_queue.put("[Cloud] Шаг 4/4: сервер готов.\n")
                 self.log_queue.put("[Cloud] Сервер инициализирован.\n")
-                self.cloud_status_var.set("Сервер готов к облачному выполнению")
+                self._set_cloud_status_async("Сервер готов к облачному выполнению")
             except Exception as error:
                 runtime.close()
                 self.log_queue.put(f"[Cloud] Ошибка инициализации: {error}\n")
-                self.cloud_status_var.set("Ошибка инициализации")
+                self._set_cloud_status_async("Ошибка инициализации")
             finally:
-                self.status_var.set("Ожидание")
+                self._set_status_async("Ожидание")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -572,12 +581,12 @@ class MailerApp:
                 else:
                     message = f"Обновление не требуется, текущий коммит: {info.local_commit}"
                 self.log_queue.put(f"[Update] {message}\n")
-                self.update_status_var.set(message)
+                self._set_update_status_async(message)
             except Exception as error:
                 self.log_queue.put(f"[Update] Ошибка проверки: {error}\n")
-                self.update_status_var.set("Ошибка проверки обновлений")
+                self._set_update_status_async("Ошибка проверки обновлений")
             finally:
-                self.status_var.set("Ожидание")
+                self._set_status_async("Ожидание")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -594,12 +603,12 @@ class MailerApp:
             try:
                 commit = apply_update(BASE_DIR)
                 self.log_queue.put(f"[Update] Обновление установлено. Коммит: {commit}\n")
-                self.update_status_var.set(f"Установлено обновление: {commit}")
+                self._set_update_status_async(f"Установлено обновление: {commit}")
             except Exception as error:
                 self.log_queue.put(f"[Update] Ошибка обновления: {error}\n")
-                self.update_status_var.set("Ошибка обновления")
+                self._set_update_status_async("Ошибка обновления")
             finally:
-                self.status_var.set("Ожидание")
+                self._set_status_async("Ожидание")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -822,14 +831,18 @@ class MailerApp:
                 pass
 
     def _poll_logs(self) -> None:
+        processed = 0
+        max_per_tick = 160
         try:
-            while True:
+            while processed < max_per_tick:
                 line = self.log_queue.get_nowait()
                 self._append_log(line)
                 self._handle_progress_line(line)
+                processed += 1
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_logs)
+        next_delay_ms = 20 if processed >= max_per_tick else 120
+        self.root.after(next_delay_ms, self._poll_logs)
 
     def _reset_progress_ui(self) -> None:
         self.progress_total = 0
@@ -1072,20 +1085,19 @@ class MailerApp:
                     self.log_queue.put(f"[Cloud] Хвост удаленного лога:\n{tail_text}\n")
                 if running:
                     self.log_queue.put("[Cloud] Задача все еще выполняется на сервере.\n")
-                    self.status_var.set("Облачная задача выполняется")
+                    self._set_status_async("Облачная задача выполняется")
                 else:
                     code_view = "unknown" if exit_code is None else str(exit_code)
                     self.log_queue.put(f"[Cloud] Задача завершена. Код: {code_view}\n")
-                    self.status_var.set("Облачная задача завершена")
+                    self._set_status_async("Облачная задача завершена")
                     self.remote_run_id = None
                     self.remote_task_meta = None
                     self._persist_cloud_last_task()
             except Exception as error:
                 self.log_queue.put(f"[Cloud] Ошибка проверки статуса: {error}\n")
-                self.status_var.set("Ошибка проверки статуса")
+                self._set_status_async("Ошибка проверки статуса")
             finally:
-                if self.status_var.get() == "Проверка статуса облачной задачи...":
-                    self.status_var.set("Ожидание")
+                pass
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1263,7 +1275,7 @@ class MailerApp:
                 self.log_queue.put(f"\n❌ Ошибка запуска: {error}\n")
             finally:
                 self._refresh_state_info()
-                self.status_var.set("Ожидание")
+                self._set_status_async("Ожидание")
                 self.process = None
                 self._close_run_log_file()
 
