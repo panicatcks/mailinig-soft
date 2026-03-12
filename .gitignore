@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+venv/
+mailer_gui_config.json
+.send_email_state.json
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.zip
+*.xlsx
+*.csv
+*.txt
+!requirements.txt
