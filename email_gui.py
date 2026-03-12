@@ -1019,17 +1019,16 @@ class MailerApp:
         force_dry_run: bool | None = None,
         override_to: list[str] | None = None,
         use_to_file: bool = True,
-    ) -> list[str]:
+    ) -> tuple[list[str], Path | None]:
         if not SCRIPT_PATH.exists():
             raise RuntimeError(f"Не найден скрипт: {SCRIPT_PATH}")
 
-        if self.auto_template_var.get():
-            self._auto_pick_template(silent=True)
-
         template = self.template_var.get().strip()
-        if not template:
-            self._auto_pick_template(silent=True)
-            template = self.template_var.get().strip()
+        guessed_template: Path | None = None
+        if not template and self.auto_template_var.get():
+            guessed_template = self._guess_template_path()
+            if guessed_template is not None:
+                template = str(guessed_template)
         if not template:
             raise RuntimeError("Не найден HTML шаблон. Проверьте папки с шаблонами.")
         to_file = self.to_file_var.get().strip()
@@ -1109,7 +1108,7 @@ class MailerApp:
         if dry_run:
             cmd.append("--dry-run")
 
-        return cmd
+        return cmd, guessed_template
 
     def _sanitize_cmd_for_log(self, cmd: list[str]) -> str:
         safe = []
@@ -1289,7 +1288,7 @@ class MailerApp:
             messagebox.showwarning("Процесс уже запущен", "Остановите текущий процесс перед новым запуском.")
             return
         try:
-            cmd = self._collect_command(
+            cmd, guessed_template = self._collect_command(
                 force_dry_run=force_dry_run,
                 override_to=override_to,
                 use_to_file=use_to_file,
@@ -1309,6 +1308,8 @@ class MailerApp:
             messagebox.showerror("Лог-файл", f"Не удалось открыть лог-файл: {error}")
             return
         self._append_log(f"Лог-файл: {log_file_path}\n")
+        if guessed_template is not None:
+            self._append_log(f"Автоподбор шаблона для запуска: {guessed_template}\n")
         self._append_log("Команда:\n")
         self._append_log(self._sanitize_cmd_for_log(cmd) + "\n\n")
         self.status_var.set("Выполняется...")
