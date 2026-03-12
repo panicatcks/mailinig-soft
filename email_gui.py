@@ -154,7 +154,7 @@ class MailerApp:
         container = ttk.Frame(self.root, padding=14)
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(6, weight=1)
+        container.rowconfigure(4, weight=1)
 
         ttk.Label(container, text=APP_TITLE, style="Header.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 10)
@@ -165,7 +165,6 @@ class MailerApp:
         self._build_smtp_section(container, row=3)
         self._build_action_tabs(container, row=4)
         self._build_status_bar(container, row=5)
-        self._build_log_section(container, row=6)
 
     def _build_template_section(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="Шаблон и тема", padding=10)
@@ -297,9 +296,9 @@ class MailerApp:
             row=3, column=4, columnspan=4, sticky="w", padx=(12, 0), pady=(8, 0)
         )
 
-    def _build_log_section(self, parent: ttk.Frame, row: int) -> None:
+    def _build_log_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Лог выполнения", padding=10)
-        frame.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
+        frame.grid(row=0, column=0, sticky="nsew", pady=(0, 0))
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -312,21 +311,26 @@ class MailerApp:
 
     def _build_action_tabs(self, parent: ttk.Frame, row: int) -> None:
         notebook = ttk.Notebook(parent)
-        notebook.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        notebook.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
 
         send_tab = ttk.Frame(notebook, padding=10)
         test_tab = ttk.Frame(notebook, padding=10)
         hub_tab = ttk.Frame(notebook, padding=10)
         cloud_tab = ttk.Frame(notebook, padding=10)
+        log_tab = ttk.Frame(notebook, padding=10)
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
         notebook.add(send_tab, text="Рассылка")
         notebook.add(test_tab, text="Тест")
         notebook.add(hub_tab, text="Хаб")
         notebook.add(cloud_tab, text="Облако")
+        notebook.add(log_tab, text="Логи")
 
         self._build_send_controls(send_tab)
         self._build_test_controls(test_tab)
         self._build_hub_controls(hub_tab)
         self._build_cloud_controls(cloud_tab)
+        self._build_log_section(log_tab)
 
     def _build_send_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(0, weight=1)
