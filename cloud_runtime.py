@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import posixpath
 import shlex
-import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -205,37 +203,53 @@ class CloudRuntime:
                 raise CloudRuntimeError(joined or f"Ошибка шага: {label}")
         return "\n".join(full_output).strip() or "Инициализация завершена."
 
-    def start_remote_process(self, argv: list[str]):
-        client, _ = self._require_client()
+    def start_remote_process_detached(self, argv: list[str]) -> dict:
+        _, _ = self._require_client()
         run_id = uuid.uuid4().hex[:12]
         self.current_run_id = run_id
         remote_dir = self.config.remote_dir.rstrip("/")
-        pid_file = f"{remote_dir}/.cloud_task_{run_id}.pid"
+        runs_dir = f"{remote_dir}/.cloud_runs"
+        pid_file = f"{runs_dir}/task_{run_id}.pid"
+        log_file = f"{runs_dir}/task_{run_id}.log"
+        status_file = f"{runs_dir}/task_{run_id}.exit"
         argv_quoted = " ".join(shlex.quote(token) for token in argv)
-        command = (
-            f"cd {shlex.quote(remote_dir)} && "
-            "export PYTHONUNBUFFERED=1 && "
-            "if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi && "
-            f"{argv_quoted} & "
+        launch_script = (
+            f"set -e; mkdir -p {shlex.quote(runs_dir)}; cd {shlex.quote(remote_dir)}; "
+            "export PYTHONUNBUFFERED=1; "
+            "if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi; "
+            f"nohup bash -lc '{argv_quoted}; rc=$?; echo $rc > {shlex.quote(status_file)}; rm -f {shlex.quote(pid_file)}; exit $rc' "
+            f"> {shlex.quote(log_file)} 2>&1 < /dev/null & "
             "pid=$!; "
             f"echo $pid > {shlex.quote(pid_file)}; "
-            "wait $pid; "
-            "status=$?; "
-            f"rm -f {shlex.quote(pid_file)}; "
-            "exit $status"
+            "echo $pid"
         )
-        transport = client.get_transport()
-        if transport is None:
-            raise CloudRuntimeError("SSH transport недоступен.")
-        channel = transport.open_session()
-        channel.get_pty()
-        channel.exec_command(command)
-        stdout = channel.makefile("r", encoding="utf-8")
-        stderr = channel.makefile_stderr("r", encoding="utf-8")
-        return run_id, pid_file, channel, stdout, stderr
+        code, out, err = self.exec(launch_script, timeout=60)
+        if code != 0:
+            raise CloudRuntimeError((out + "\n" + err).strip() or "Не удалось запустить задачу в облаке.")
+        pid = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if not pid.isdigit():
+            raise CloudRuntimeError(f"Не удалось получить PID процесса. Ответ: {(out + err).strip()}")
+        return {
+            "run_id": run_id,
+            "pid": pid,
+            "pid_file": pid_file,
+            "log_file": log_file,
+            "status_file": status_file,
+        }
+
+    def is_remote_process_running(self, pid_file: str) -> bool:
+        command = (
+            f"if [ -f {shlex.quote(pid_file)} ]; then "
+            f"pid=$(cat {shlex.quote(pid_file)}); "
+            "kill -0 \"$pid\" >/dev/null 2>&1 && echo RUNNING || echo STOPPED; "
+            "else echo STOPPED; fi"
+        )
+        code, out, _err = self.exec(command, timeout=20)
+        return code == 0 and "RUNNING" in out
 
     def stop_remote_process(self, run_id: str) -> tuple[bool, str]:
-        pid_file = f"{self.config.remote_dir.rstrip('/')}/.cloud_task_{run_id}.pid"
+        runs_dir = f"{self.config.remote_dir.rstrip('/')}/.cloud_runs"
+        pid_file = f"{runs_dir}/task_{run_id}.pid"
         command = (
             f"if [ -f {shlex.quote(pid_file)} ]; then "
             f"kill -TERM $(cat {shlex.quote(pid_file)}) && echo STOP_SENT; "
@@ -255,6 +269,34 @@ class CloudRuntime:
         self._remote_mkdirs(posixpath.dirname(remote_path))
         with sftp.open(remote_path, "w") as handle:
             handle.write(content)
+
+    def read_log_chunk(self, remote_path: str, offset: int) -> tuple[str, int]:
+        _, sftp = self._require_client()
+        try:
+            stats = sftp.stat(remote_path)
+        except OSError:
+            return "", offset
+        size = int(stats.st_size)
+        if size <= offset:
+            return "", offset
+        with sftp.open(remote_path, "r") as handle:
+            handle.seek(offset)
+            data = handle.read(size - offset)
+        text = data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+        return text, size
+
+    def read_exit_code(self, status_file: str) -> int | None:
+        command = f"if [ -f {shlex.quote(status_file)} ]; then cat {shlex.quote(status_file)}; fi"
+        code, out, _err = self.exec(command, timeout=20)
+        if code != 0:
+            return None
+        raw = out.strip()
+        if not raw:
+            return None
+        try:
+            return int(raw.splitlines()[-1].strip())
+        except Exception:
+            return None
 
 
 def stream_channel_lines(channel, stdout, stderr, on_line) -> int:

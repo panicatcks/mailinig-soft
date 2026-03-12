@@ -12,6 +12,7 @@ import hmac
 import time
 import uuid
 import ssl
+import shlex
 from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -19,8 +20,8 @@ from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from cloud_runtime import CloudRuntime, CloudRuntimeError, ServerConfig, stream_channel_lines
-from self_update import UpdateError, apply_update, check_for_updates
+from cloud_runtime import CloudRuntime, ServerConfig
+from self_update import apply_update, check_for_updates
 
 
 APP_TITLE = "SMTP Рассылка — ПРОМТЕХРЕШЕНИЯ"
@@ -41,6 +42,7 @@ class MailerApp:
         self.worker_thread: threading.Thread | None = None
         self.cloud_runtime: CloudRuntime | None = None
         self.remote_run_id: str | None = None
+        self.remote_task_meta: dict | None = None
         self.current_log_file_path: Path | None = None
         self.current_log_handle = None
         self.progress_total = 0
@@ -97,6 +99,18 @@ class MailerApp:
                 pass
         self.current_log_handle = None
         self.current_log_file_path = None
+
+    def _persist_cloud_last_task(self) -> None:
+        data = {}
+        if CONFIG_PATH.exists():
+            try:
+                loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+        data["cloud_last_task"] = self.remote_task_meta or {}
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _bind_state_traces(self) -> None:
         variables = [
@@ -457,6 +471,7 @@ class MailerApp:
         ttk.Button(actions, text="Инициализация сервера", command=self._initialize_server).grid(row=0, column=0)
         ttk.Button(actions, text="Проверить обновления", command=self._check_for_updates).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(actions, text="Обновить программу", command=self._apply_update).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(actions, text="Статус облачной задачи", command=self._check_cloud_task_status).grid(row=0, column=3, padx=(8, 0))
 
         ttk.Label(frame, text="Статус облака:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
         ttk.Label(frame, textvariable=self.cloud_status_var).grid(row=5, column=1, columnspan=3, sticky="w", pady=(10, 0))
@@ -464,7 +479,7 @@ class MailerApp:
         ttk.Label(frame, textvariable=self.update_status_var).grid(row=6, column=1, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(
             frame,
-            text="Если включен облачный режим, отправка выполняется на сервере, а лог и прогресс остаются в локальном окне.",
+            text="При облачном режиме задача продолжает выполняться на сервере даже если GUI закрыт.",
         ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
     def _build_server_config(self) -> ServerConfig:
@@ -1028,6 +1043,48 @@ class MailerApp:
         self.cloud_runtime = runtime
         return runtime
 
+    def _tail_remote_log(self, runtime: CloudRuntime, log_file: str, max_bytes: int = 4000) -> str:
+        command = f"if [ -f {shlex.quote(log_file)} ]; then tail -c {max_bytes} {shlex.quote(log_file)}; fi"
+        code, out, err = runtime.exec(command, timeout=30)
+        if code != 0:
+            return (out + "\n" + err).strip()
+        return out
+
+    def _check_cloud_task_status(self) -> None:
+        task = self.remote_task_meta
+        if not task:
+            messagebox.showinfo("Облачная задача", "Активная облачная задача не найдена в текущей сессии.")
+            return
+        self.status_var.set("Проверка статуса облачной задачи...")
+        self._append_log("\n[Cloud] Проверка статуса задачи...\n")
+
+        def worker() -> None:
+            try:
+                runtime = self._ensure_cloud_runtime()
+                running = runtime.is_remote_process_running(task["pid_file"])
+                exit_code = runtime.read_exit_code(task["status_file"])
+                tail_text = self._tail_remote_log(runtime, task["log_file"])
+                if tail_text.strip():
+                    self.log_queue.put(f"[Cloud] Хвост удаленного лога:\n{tail_text}\n")
+                if running:
+                    self.log_queue.put("[Cloud] Задача все еще выполняется на сервере.\n")
+                    self.status_var.set("Облачная задача выполняется")
+                else:
+                    code_view = "unknown" if exit_code is None else str(exit_code)
+                    self.log_queue.put(f"[Cloud] Задача завершена. Код: {code_view}\n")
+                    self.status_var.set("Облачная задача завершена")
+                    self.remote_run_id = None
+                    self.remote_task_meta = None
+                    self._persist_cloud_last_task()
+            except Exception as error:
+                self.log_queue.put(f"[Cloud] Ошибка проверки статуса: {error}\n")
+                self.status_var.set("Ошибка проверки статуса")
+            finally:
+                if self.status_var.get() == "Проверка статуса облачной задачи...":
+                    self.status_var.set("Ожидание")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _start_dry_run(self) -> None:
         self._start_process(force_dry_run=True)
 
@@ -1157,11 +1214,31 @@ class MailerApp:
                     self.log_queue.put("[Cloud] Синхронизация файлов проекта...\n")
                     runtime.upload_project()
                     remote_cmd = self._build_remote_command(cmd)
-                    self.log_queue.put("[Cloud] Запуск задачи на сервере...\n")
-                    run_id, _pid_file, channel, stdout, stderr = runtime.start_remote_process(remote_cmd)
-                    self.remote_run_id = run_id
-                    code = stream_channel_lines(channel, stdout, stderr, self.log_queue.put)
+                    self.log_queue.put("[Cloud] Запуск задачи на сервере (detached)...\n")
+                    task = runtime.start_remote_process_detached(remote_cmd)
+                    self.remote_run_id = task["run_id"]
+                    self.remote_task_meta = task
+                    self._persist_cloud_last_task()
+                    self.log_queue.put(f"[Cloud] Task ID: {task['run_id']}\n")
+                    self.log_queue.put(f"[Cloud] Remote log: {task['log_file']}\n")
+                    log_offset = 0
+                    code: int | None = None
+                    while True:
+                        chunk, log_offset = runtime.read_log_chunk(task["log_file"], log_offset)
+                        if chunk:
+                            self.log_queue.put(chunk)
+                        running = runtime.is_remote_process_running(task["pid_file"])
+                        if not running:
+                            chunk, log_offset = runtime.read_log_chunk(task["log_file"], log_offset)
+                            if chunk:
+                                self.log_queue.put(chunk)
+                            exit_code = runtime.read_exit_code(task["status_file"])
+                            code = 0 if exit_code is None else exit_code
+                            break
+                        time.sleep(0.35)
                     self.remote_run_id = None
+                    self.remote_task_meta = None
+                    self._persist_cloud_last_task()
                 else:
                     self.process = subprocess.Popen(
                         cmd,
@@ -1190,9 +1267,10 @@ class MailerApp:
         self.worker_thread.start()
 
     def _stop_process(self) -> None:
-        if self.remote_run_id and self.cloud_runtime is not None:
+        if self.remote_run_id:
             try:
-                stopped, message = self.cloud_runtime.stop_remote_process(self.remote_run_id)
+                runtime = self._ensure_cloud_runtime()
+                stopped, message = runtime.stop_remote_process(self.remote_run_id)
                 if stopped:
                     self._append_log("\n⏹ Запрошена остановка облачной задачи.\n")
                 else:
@@ -1244,6 +1322,7 @@ class MailerApp:
             "server_user": self.server_user_var.get().strip(),
             "server_password": self.server_password_var.get().strip(),
             "server_remote_dir": self.server_remote_dir_var.get().strip(),
+            "cloud_last_task": self.remote_task_meta or {},
             "dry_run": self.dry_run_var.get(),
             "test_email": self.test_email_var.get().strip(),
         }
@@ -1295,6 +1374,11 @@ class MailerApp:
         self.server_user_var.set(data.get("server_user", ""))
         self.server_password_var.set(data.get("server_password", ""))
         self.server_remote_dir_var.set(data.get("server_remote_dir", "~/mailinig-soft-cloud"))
+        last_task = data.get("cloud_last_task", {})
+        self.remote_task_meta = last_task if isinstance(last_task, dict) and last_task else None
+        if self.remote_task_meta and self.remote_task_meta.get("run_id"):
+            self.remote_run_id = str(self.remote_task_meta.get("run_id"))
+            self.cloud_status_var.set(f"Найдена задача: {self.remote_run_id}")
         self.dry_run_var.set(bool(data.get("dry_run", False)))
         self.test_email_var.set(data.get("test_email", ""))
         self._refresh_state_info()
