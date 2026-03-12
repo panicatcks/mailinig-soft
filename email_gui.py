@@ -53,6 +53,7 @@ class MailerApp:
         self.progress_running = False
         self.settings_dirty = False
         self._suspend_dirty_tracking = True
+        self.server_init_in_progress = False
 
         self._setup_style()
         self._build_ui()
@@ -66,6 +67,7 @@ class MailerApp:
         self.settings_dirty = False
         self._poll_logs()
         self.root.after(1200, self._check_for_updates)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
     def _set_status_async(self, value: str) -> None:
         self.root.after(0, lambda: self.status_var.set(value))
@@ -75,6 +77,18 @@ class MailerApp:
 
     def _set_update_status_async(self, value: str) -> None:
         self.root.after(0, lambda: self.update_status_var.set(value))
+
+    def _on_window_close(self) -> None:
+        if self.server_init_in_progress:
+            should_close = messagebox.askyesno(
+                "Инициализация сервера",
+                "Инициализация сервера еще идет. Закрыть программу и прервать процесс?",
+            )
+            if not should_close:
+                return
+            self.server_init_in_progress = False
+            self.cloud_status_var.set("Инициализация прервана, требуется повторный запуск")
+        self.root.destroy()
 
     def _set_settings_dirty(self, value: bool) -> None:
         self.settings_dirty = value
@@ -560,12 +574,16 @@ class MailerApp:
         )
 
     def _initialize_server(self) -> None:
+        if self.server_init_in_progress:
+            messagebox.showwarning("Инициализация сервера", "Инициализация уже выполняется.")
+            return
         try:
             server_config = self._build_server_config()
         except Exception as error:
             messagebox.showerror("Инициализация сервера", str(error))
             return
 
+        self.server_init_in_progress = True
         self._append_log("\n[Cloud] Подключение к серверу и инициализация...\n")
         self.cloud_status_var.set("Инициализация...")
         self.status_var.set("Инициализация сервера...")
@@ -611,6 +629,7 @@ class MailerApp:
                 self.log_queue.put(f"[Cloud] Ошибка инициализации: {error}\n")
                 self._set_cloud_status_async("Ошибка инициализации")
             finally:
+                self.server_init_in_progress = False
                 self._set_status_async("Ожидание")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -637,6 +656,9 @@ class MailerApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_update(self) -> None:
+        if self.server_init_in_progress:
+            messagebox.showwarning("Обновление", "Дождитесь завершения инициализации сервера.")
+            return
         if self.process and self.process.poll() is None:
             messagebox.showwarning("Обновление", "Сначала остановите текущую задачу.")
             return
@@ -680,6 +702,9 @@ class MailerApp:
             self._append_log("[Update] Перезапуск отложен.\n")
 
     def _restart_application(self) -> None:
+        if self.server_init_in_progress:
+            messagebox.showwarning("Перезапуск", "Нельзя перезапускать программу во время инициализации сервера.")
+            return
         self._append_log("[Update] Перезапуск приложения...\n")
         python = sys.executable
         args = [python, *sys.argv]
