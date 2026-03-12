@@ -67,6 +67,7 @@ TAG_INLINE_STYLES = {
 }
 
 STOP_REQUESTED = False
+BUILD_MARKER = "cloud-sync-test-20260312-1"
 
 
 def request_stop(signum, _frame) -> None:
@@ -824,6 +825,7 @@ def send_campaign_report_to_hub(
 
 
 def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_path: Path) -> None:
+    print(f"Build marker: {BUILD_MARKER}")
     templates_cache: dict[Path, tuple[str, str, Path]] = {}
 
     def get_template_content(current_template_path: Path) -> tuple[str, str, Path]:
