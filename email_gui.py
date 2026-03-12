@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import tkinter as tk
 import hashlib
@@ -50,6 +51,8 @@ class MailerApp:
         self.progress_failed = 0
         self.progress_skipped = 0
         self.progress_running = False
+        self.settings_dirty = False
+        self._suspend_dirty_tracking = True
 
         self._setup_style()
         self._build_ui()
@@ -59,6 +62,8 @@ class MailerApp:
             self._auto_pick_to_file(silent=True)
         if not self.template_var.get().strip():
             self._auto_pick_template(silent=True)
+        self._suspend_dirty_tracking = False
+        self.settings_dirty = False
         self._poll_logs()
         self.root.after(1200, self._check_for_updates)
 
@@ -70,6 +75,11 @@ class MailerApp:
 
     def _set_update_status_async(self, value: str) -> None:
         self.root.after(0, lambda: self.update_status_var.set(value))
+
+    def _set_settings_dirty(self, value: bool) -> None:
+        self.settings_dirty = value
+        suffix = " *" if value else ""
+        self.root.title(APP_TITLE + suffix)
 
     def _sanitize_filename_part(self, text: str) -> str:
         value = re.sub(r"[^\w\-\.]+", "_", text.strip(), flags=re.UNICODE).strip("._")
@@ -121,8 +131,17 @@ class MailerApp:
         data["cloud_last_task"] = self.remote_task_meta or {}
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _on_refresh_trigger(self, *_args) -> None:
+        self._refresh_state_info()
+        if not self._suspend_dirty_tracking:
+            self._set_settings_dirty(True)
+
+    def _on_dirty_trigger(self, *_args) -> None:
+        if not self._suspend_dirty_tracking:
+            self._set_settings_dirty(True)
+
     def _bind_state_traces(self) -> None:
-        variables = [
+        refresh_vars = [
             self.template_var,
             self.to_file_var,
             self.email_col_var,
@@ -135,8 +154,35 @@ class MailerApp:
             self.use_kind_template_var,
             self.state_file_var,
         ]
-        for var in variables:
-            var.trace_add("write", lambda *_args: self._refresh_state_info())
+        dirty_only_vars = [
+            self.subject_var,
+            self.auto_template_var,
+            self.extra_to_var,
+            self.smtp_host_var,
+            self.smtp_port_var,
+            self.smtp_user_var,
+            self.smtp_pass_var,
+            self.remember_password_var,
+            self.from_email_var,
+            self.limit_min_var,
+            self.limit_day_var,
+            self.hub_url_var,
+            self.hub_connection_id_var,
+            self.hub_secret_var,
+            self.hub_insecure_ssl_var,
+            self.cloud_enabled_var,
+            self.server_host_var,
+            self.server_port_var,
+            self.server_user_var,
+            self.server_password_var,
+            self.server_remote_dir_var,
+            self.dry_run_var,
+            self.test_email_var,
+        ]
+        for var in refresh_vars:
+            var.trace_add("write", self._on_refresh_trigger)
+        for var in dirty_only_vars:
+            var.trace_add("write", self._on_dirty_trigger)
 
     def _add_paste_support(self, widget: ttk.Entry) -> None:
         def handle_paste(_event=None):
@@ -604,6 +650,7 @@ class MailerApp:
                 commit = apply_update(BASE_DIR)
                 self.log_queue.put(f"[Update] Обновление установлено. Коммит: {commit}\n")
                 self._set_update_status_async(f"Установлено обновление: {commit}")
+                self.root.after(0, lambda c=commit: self._handle_update_installed(c))
             except Exception as error:
                 self.log_queue.put(f"[Update] Ошибка обновления: {error}\n")
                 self._set_update_status_async("Ошибка обновления")
@@ -611,6 +658,33 @@ class MailerApp:
                 self._set_status_async("Ожидание")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_update_installed(self, commit: str) -> None:
+        if self.settings_dirty:
+            answer = messagebox.askyesnocancel(
+                "Сохранить настройки",
+                "Есть несохраненные настройки. Сохранить перед перезапуском?",
+            )
+            if answer is None:
+                self._append_log("[Update] Перезапуск отменен пользователем.\n")
+                return
+            if answer:
+                self._save_config()
+        should_restart = messagebox.askyesno(
+            "Обновление установлено",
+            f"Установлен коммит {commit}. Перезапустить программу сейчас?",
+        )
+        if should_restart:
+            self._restart_application()
+        else:
+            self._append_log("[Update] Перезапуск отложен.\n")
+
+    def _restart_application(self) -> None:
+        self._append_log("[Update] Перезапуск приложения...\n")
+        python = sys.executable
+        args = [python, *sys.argv]
+        subprocess.Popen(args, cwd=str(BASE_DIR))
+        self.root.after(100, self.root.destroy)
 
     def _build_status_bar(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.Frame(parent)
@@ -822,7 +896,23 @@ class MailerApp:
 
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
-        self.log_text.see("end")
+        if self.log_text.yview()[1] > 0.98:
+            self.log_text.see("end")
+        if self.current_log_handle is not None:
+            try:
+                self.current_log_handle.write(text)
+                self.current_log_handle.flush()
+            except Exception:
+                pass
+
+    def _append_log_batch(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        text = "".join(lines)
+        at_bottom = self.log_text.yview()[1] > 0.98
+        self.log_text.insert("end", text)
+        if at_bottom:
+            self.log_text.see("end")
         if self.current_log_handle is not None:
             try:
                 self.current_log_handle.write(text)
@@ -833,14 +923,16 @@ class MailerApp:
     def _poll_logs(self) -> None:
         processed = 0
         max_per_tick = 160
+        lines: list[str] = []
         try:
             while processed < max_per_tick:
                 line = self.log_queue.get_nowait()
-                self._append_log(line)
+                lines.append(line)
                 self._handle_progress_line(line)
                 processed += 1
         except queue.Empty:
             pass
+        self._append_log_batch(lines)
         next_delay_ms = 20 if processed >= max_per_tick else 120
         self.root.after(next_delay_ms, self._poll_logs)
 
@@ -1274,7 +1366,7 @@ class MailerApp:
             except Exception as error:
                 self.log_queue.put(f"\n❌ Ошибка запуска: {error}\n")
             finally:
-                self._refresh_state_info()
+                self.root.after(0, self._refresh_state_info)
                 self._set_status_async("Ожидание")
                 self.process = None
                 self._close_run_log_file()
@@ -1345,6 +1437,7 @@ class MailerApp:
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         self._append_log(f"\nНастройки сохранены: {CONFIG_PATH}\n")
         self._refresh_state_info()
+        self._set_settings_dirty(False)
 
     def _load_config(self) -> None:
         if not CONFIG_PATH.exists():
@@ -1354,50 +1447,55 @@ class MailerApp:
         except Exception:
             return
 
-        self.template_var.set(data.get("template", ""))
-        self.subject_var.set(data.get("subject", ""))
-        self.auto_template_var.set(bool(data.get("auto_template", True)))
-        self.to_file_var.set(data.get("to_file", ""))
-        self.email_col_var.set(data.get("email_col", "G"))
-        self.kind_col_var.set(data.get("kind_col", "P"))
-        self.kind_filter_var.set(data.get("kind_filter", "ALL"))
-        self.fields_var.set(data.get("fields", "A,B,C,D"))
-        self.start_row_var.set(data.get("start_row", "2"))
-        self.sheet_var.set(data.get("sheet", "active"))
-        self.extra_to_var.set(data.get("extra_to", ""))
-        self.use_kind_template_var.set(bool(data.get("use_kind_template", True)))
-        self.allow_duplicate_emails_var.set(bool(data.get("allow_duplicate_emails", False)))
-        self.state_file_var.set(data.get("state_file", ".send_email_state.json"))
-        self.smtp_host_var.set(data.get("smtp_host", "smtp.timeweb.ru"))
-        self.smtp_port_var.set(data.get("smtp_port", "465"))
-        self.smtp_user_var.set(data.get("smtp_user", "SZFO@teploobmennik.online"))
-        remember_password = bool(data.get("remember_password", False))
-        self.remember_password_var.set(remember_password)
-        if remember_password:
-            self.smtp_pass_var.set(data.get("smtp_password", ""))
-        elif not self.smtp_pass_var.get().strip():
-            self.smtp_pass_var.set(os.getenv("SMTP_PASSWORD", ""))
-        self.from_email_var.set(data.get("from_email", self.smtp_user_var.get()))
-        self.limit_min_var.set(data.get("limit_min", "20"))
-        self.limit_day_var.set(data.get("limit_day", "300"))
-        self.hub_url_var.set(data.get("hub_url", ""))
-        self.hub_connection_id_var.set(data.get("hub_connection_id", ""))
-        self.hub_secret_var.set(data.get("hub_secret", ""))
-        self.hub_insecure_ssl_var.set(bool(data.get("hub_insecure_ssl", False)))
-        self.cloud_enabled_var.set(bool(data.get("cloud_enabled", False)))
-        self.server_host_var.set(data.get("server_host", ""))
-        self.server_port_var.set(data.get("server_port", "22"))
-        self.server_user_var.set(data.get("server_user", ""))
-        self.server_password_var.set(data.get("server_password", ""))
-        self.server_remote_dir_var.set(data.get("server_remote_dir", "~/mailinig-soft-cloud"))
-        last_task = data.get("cloud_last_task", {})
-        self.remote_task_meta = last_task if isinstance(last_task, dict) and last_task else None
-        if self.remote_task_meta and self.remote_task_meta.get("run_id"):
-            self.remote_run_id = str(self.remote_task_meta.get("run_id"))
-            self.cloud_status_var.set(f"Найдена задача: {self.remote_run_id}")
-        self.dry_run_var.set(bool(data.get("dry_run", False)))
-        self.test_email_var.set(data.get("test_email", ""))
-        self._refresh_state_info()
+        previous_suspend = self._suspend_dirty_tracking
+        self._suspend_dirty_tracking = True
+        try:
+            self.template_var.set(data.get("template", ""))
+            self.subject_var.set(data.get("subject", ""))
+            self.auto_template_var.set(bool(data.get("auto_template", True)))
+            self.to_file_var.set(data.get("to_file", ""))
+            self.email_col_var.set(data.get("email_col", "G"))
+            self.kind_col_var.set(data.get("kind_col", "P"))
+            self.kind_filter_var.set(data.get("kind_filter", "ALL"))
+            self.fields_var.set(data.get("fields", "A,B,C,D"))
+            self.start_row_var.set(data.get("start_row", "2"))
+            self.sheet_var.set(data.get("sheet", "active"))
+            self.extra_to_var.set(data.get("extra_to", ""))
+            self.use_kind_template_var.set(bool(data.get("use_kind_template", True)))
+            self.allow_duplicate_emails_var.set(bool(data.get("allow_duplicate_emails", False)))
+            self.state_file_var.set(data.get("state_file", ".send_email_state.json"))
+            self.smtp_host_var.set(data.get("smtp_host", "smtp.timeweb.ru"))
+            self.smtp_port_var.set(data.get("smtp_port", "465"))
+            self.smtp_user_var.set(data.get("smtp_user", "SZFO@teploobmennik.online"))
+            remember_password = bool(data.get("remember_password", False))
+            self.remember_password_var.set(remember_password)
+            if remember_password:
+                self.smtp_pass_var.set(data.get("smtp_password", ""))
+            elif not self.smtp_pass_var.get().strip():
+                self.smtp_pass_var.set(os.getenv("SMTP_PASSWORD", ""))
+            self.from_email_var.set(data.get("from_email", self.smtp_user_var.get()))
+            self.limit_min_var.set(data.get("limit_min", "20"))
+            self.limit_day_var.set(data.get("limit_day", "300"))
+            self.hub_url_var.set(data.get("hub_url", ""))
+            self.hub_connection_id_var.set(data.get("hub_connection_id", ""))
+            self.hub_secret_var.set(data.get("hub_secret", ""))
+            self.hub_insecure_ssl_var.set(bool(data.get("hub_insecure_ssl", False)))
+            self.cloud_enabled_var.set(bool(data.get("cloud_enabled", False)))
+            self.server_host_var.set(data.get("server_host", ""))
+            self.server_port_var.set(data.get("server_port", "22"))
+            self.server_user_var.set(data.get("server_user", ""))
+            self.server_password_var.set(data.get("server_password", ""))
+            self.server_remote_dir_var.set(data.get("server_remote_dir", "~/mailinig-soft-cloud"))
+            last_task = data.get("cloud_last_task", {})
+            self.remote_task_meta = last_task if isinstance(last_task, dict) and last_task else None
+            if self.remote_task_meta and self.remote_task_meta.get("run_id"):
+                self.remote_run_id = str(self.remote_task_meta.get("run_id"))
+                self.cloud_status_var.set(f"Найдена задача: {self.remote_run_id}")
+            self.dry_run_var.set(bool(data.get("dry_run", False)))
+            self.test_email_var.set(data.get("test_email", ""))
+            self._refresh_state_info()
+        finally:
+            self._suspend_dirty_tracking = previous_suspend
 
 
 def main() -> None:
