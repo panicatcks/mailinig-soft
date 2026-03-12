@@ -41,6 +41,8 @@ class MailerApp:
         self.worker_thread: threading.Thread | None = None
         self.cloud_runtime: CloudRuntime | None = None
         self.remote_run_id: str | None = None
+        self.current_log_file_path: Path | None = None
+        self.current_log_handle = None
         self.progress_total = 0
         self.progress_sent = 0
         self.progress_failed = 0
@@ -57,6 +59,44 @@ class MailerApp:
             self._auto_pick_template(silent=True)
         self._poll_logs()
         self.root.after(1200, self._check_for_updates)
+
+    def _sanitize_filename_part(self, text: str) -> str:
+        value = re.sub(r"[^\w\-\.]+", "_", text.strip(), flags=re.UNICODE).strip("._")
+        return value[:80] if value else "run"
+
+    def _begin_run_log_file(
+        self,
+        *,
+        force_dry_run: bool,
+        override_to: list[str] | None,
+        use_to_file: bool,
+    ) -> Path:
+        logs_dir = BASE_DIR / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        mode = "dry-run" if force_dry_run else "send"
+        target = "test" if (override_to and not use_to_file) else "campaign"
+        execution = "cloud" if self.cloud_enabled_var.get() else "local"
+        base_hint = ""
+        if use_to_file and self.to_file_var.get().strip():
+            base_hint = Path(self.to_file_var.get().strip()).stem
+        elif self.template_var.get().strip():
+            base_hint = Path(self.template_var.get().strip()).stem
+        base_safe = self._sanitize_filename_part(base_hint)
+        file_name = f"{timestamp}_{execution}_{mode}_{target}_{base_safe}.log"
+        log_path = logs_dir / file_name
+        self.current_log_file_path = log_path
+        self.current_log_handle = log_path.open("a", encoding="utf-8")
+        return log_path
+
+    def _close_run_log_file(self) -> None:
+        if self.current_log_handle is not None:
+            try:
+                self.current_log_handle.close()
+            except Exception:
+                pass
+        self.current_log_handle = None
+        self.current_log_file_path = None
 
     def _bind_state_traces(self) -> None:
         variables = [
@@ -459,11 +499,37 @@ class MailerApp:
         def worker() -> None:
             runtime = CloudRuntime(server_config, BASE_DIR)
             try:
+                self.log_queue.put("[Cloud] Шаг 1/4: подключение по SSH...\n")
                 runtime.connect()
-                uploaded = runtime.upload_project()
-                runtime.initialize_server()
+                self.log_queue.put("[Cloud] Шаг 2/4: загрузка файлов на сервер...\n")
+
+                last_reported_index = 0
+
+                def upload_progress(index: int, total: int, relative: str) -> None:
+                    nonlocal last_reported_index
+                    if index == 1 or index == total or index - last_reported_index >= 15:
+                        last_reported_index = index
+                        self.log_queue.put(
+                            f"[Cloud] Загрузка: {index}/{total} ({relative})\n"
+                        )
+
+                uploaded = runtime.upload_project(on_progress=upload_progress)
+
+                self.log_queue.put("[Cloud] Шаг 3/4: установка зависимостей на сервере...\n")
+
+                def step_progress(label: str) -> None:
+                    self.log_queue.put(f"[Cloud] {label}...\n")
+
+                init_output = runtime.initialize_server(on_step=step_progress)
                 self.cloud_runtime = runtime
                 self.log_queue.put(f"[Cloud] Загружено файлов: {len(uploaded)}\n")
+                if init_output:
+                    trimmed = init_output
+                    if len(trimmed) > 3500:
+                        trimmed = trimmed[-3500:]
+                        self.log_queue.put("[Cloud] Вывод инициализации сокращен (показан хвост).\n")
+                    self.log_queue.put(f"[Cloud] Вывод инициализации:\n{trimmed}\n")
+                self.log_queue.put("[Cloud] Шаг 4/4: сервер готов.\n")
                 self.log_queue.put("[Cloud] Сервер инициализирован.\n")
                 self.cloud_status_var.set("Сервер готов к облачному выполнению")
             except Exception as error:
@@ -729,6 +795,12 @@ class MailerApp:
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
         self.log_text.see("end")
+        if self.current_log_handle is not None:
+            try:
+                self.current_log_handle.write(text)
+                self.current_log_handle.flush()
+            except Exception:
+                pass
 
     def _poll_logs(self) -> None:
         try:
@@ -1062,6 +1134,16 @@ class MailerApp:
             return
 
         self._append_log("\n" + "=" * 72 + "\n")
+        try:
+            log_file_path = self._begin_run_log_file(
+                force_dry_run=force_dry_run,
+                override_to=override_to,
+                use_to_file=use_to_file,
+            )
+        except Exception as error:
+            messagebox.showerror("Лог-файл", f"Не удалось открыть лог-файл: {error}")
+            return
+        self._append_log(f"Лог-файл: {log_file_path}\n")
         self._append_log("Команда:\n")
         self._append_log(self._sanitize_cmd_for_log(cmd) + "\n\n")
         self.status_var.set("Выполняется...")
@@ -1102,6 +1184,7 @@ class MailerApp:
                 self._refresh_state_info()
                 self.status_var.set("Ожидание")
                 self.process = None
+                self._close_run_log_file()
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()

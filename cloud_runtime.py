@@ -129,39 +129,81 @@ class CloudRuntime:
             except OSError:
                 sftp.mkdir(item)
 
-    def upload_project(self) -> list[str]:
+    def upload_project(self, on_progress=None) -> list[str]:
         _, sftp = self._require_client()
         remote_root = self.config.remote_dir.rstrip("/")
         self._remote_mkdirs(remote_root)
         uploaded: list[str] = []
-        for local_path in iter_project_files(self.base_dir):
+        files = iter_project_files(self.base_dir)
+        total = len(files)
+        for index, local_path in enumerate(files, start=1):
             relative = local_path.relative_to(self.base_dir).as_posix()
             remote_path = f"{remote_root}/{relative}"
             remote_parent = posixpath.dirname(remote_path)
             self._remote_mkdirs(remote_parent)
             sftp.put(str(local_path), remote_path)
             uploaded.append(relative)
+            if on_progress:
+                on_progress(index, total, relative)
         return uploaded
 
-    def initialize_server(self) -> str:
+    def initialize_server(self, on_step=None) -> str:
         remote_dir = shlex.quote(self.config.remote_dir)
         password = shlex.quote(self.config.password)
-        bootstrap = (
-            f"set -e; mkdir -p {remote_dir}; "
-            "if command -v apt-get >/dev/null 2>&1; then "
-            f"printf '%s\\n' {password} | sudo -S apt-get update -y >/dev/null 2>&1 || true; "
-            f"printf '%s\\n' {password} | sudo -S apt-get install -y python3 python3-venv python3-pip curl unzip git >/dev/null 2>&1 || true; "
-            "fi; "
-            f"cd {remote_dir}; "
-            "python3 -m venv .venv >/dev/null 2>&1 || true; "
-            ". .venv/bin/activate; "
-            "python -m pip install --upgrade pip >/dev/null 2>&1; "
-            "python -m pip install openpyxl paramiko >/dev/null 2>&1"
-        )
-        code, out, err = self.exec(bootstrap, timeout=900)
-        if code != 0:
-            raise CloudRuntimeError((out + "\n" + err).strip() or "Ошибка инициализации сервера.")
-        return (out + "\n" + err).strip() or "Инициализация завершена."
+        steps = [
+            (
+                "Создание рабочей папки",
+                f"mkdir -p {remote_dir}",
+                60,
+            ),
+            (
+                "Проверка доступа sudo",
+                f"printf '%s\\n' {password} | sudo -S -v",
+                60,
+            ),
+            (
+                "Обновление пакетов apt",
+                f"if command -v apt-get >/dev/null 2>&1; then printf '%s\\n' {password} | sudo -S apt-get update -y; fi",
+                900,
+            ),
+            (
+                "Установка системных зависимостей",
+                (
+                    "if command -v apt-get >/dev/null 2>&1; then "
+                    f"printf '%s\\n' {password} | sudo -S apt-get install -y python3 python3-venv python3-pip curl unzip git; "
+                    "fi"
+                ),
+                900,
+            ),
+            (
+                "Создание виртуального окружения",
+                f"cd {remote_dir} && python3 -m venv .venv",
+                120,
+            ),
+            (
+                "Обновление pip",
+                f"cd {remote_dir} && . .venv/bin/activate && python -m pip install --upgrade pip",
+                300,
+            ),
+            (
+                "Установка python-зависимостей",
+                f"cd {remote_dir} && . .venv/bin/activate && python -m pip install openpyxl paramiko",
+                600,
+            ),
+        ]
+        full_output: list[str] = []
+        for label, command, timeout in steps:
+            if on_step:
+                on_step(label)
+            code, out, err = self.exec(command, timeout=timeout)
+            if out.strip():
+                full_output.append(out.strip())
+            if err.strip():
+                full_output.append(err.strip())
+            if code != 0:
+                joined = "\n".join(full_output).strip()
+                raise CloudRuntimeError(joined or f"Ошибка шага: {label}")
+        return "\n".join(full_output).strip() or "Инициализация завершена."
 
     def start_remote_process(self, argv: list[str]):
         client, _ = self._require_client()
