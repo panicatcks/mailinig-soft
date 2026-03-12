@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import tempfile
 import zipfile
@@ -25,6 +26,25 @@ class UpdateInfo:
 
 class UpdateError(RuntimeError):
     pass
+
+
+def _urlopen_with_tls_fallback(req: Request, timeout: int = 20):
+    context = None
+    try:
+        import certifi  # type: ignore
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = ssl.create_default_context()
+
+    try:
+        return urlopen(req, timeout=timeout, context=context)
+    except URLError as error:
+        message = str(error)
+        if "CERTIFICATE_VERIFY_FAILED" not in message:
+            raise
+        insecure_context = ssl._create_unverified_context()
+        return urlopen(req, timeout=timeout, context=insecure_context)
 
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -53,7 +73,7 @@ def get_local_commit(base_dir: Path) -> str:
 def fetch_remote_commit() -> str:
     req = Request(API_COMMITS_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "mailinig-soft-updater"})
     try:
-        with urlopen(req, timeout=20) as response:
+        with _urlopen_with_tls_fallback(req, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except URLError as error:  # pragma: no cover
         raise UpdateError(f"Не удалось проверить обновление: {error}") from error
@@ -114,7 +134,7 @@ def update_with_archive(base_dir: Path) -> str:
         tmp_dir = Path(tmp_dir_raw)
         archive_path = tmp_dir / "main.zip"
         req = Request(ZIP_URL, headers={"User-Agent": "mailinig-soft-updater"})
-        with urlopen(req, timeout=60) as response:
+        with _urlopen_with_tls_fallback(req, timeout=60) as response:
             archive_path.write_bytes(response.read())
         with zipfile.ZipFile(archive_path) as zf:
             zf.extractall(tmp_dir)
