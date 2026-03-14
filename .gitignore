@@ -15,3 +15,4 @@ mailer_gui_config.json
 *.csv
 *.txt
 !requirements.txt
+.update_state.json

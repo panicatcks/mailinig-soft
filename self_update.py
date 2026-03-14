@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -15,6 +15,8 @@ from urllib.request import Request, urlopen
 
 API_COMMITS_URL = "https://api.github.com/repos/panicatcks/mailinig-soft/commits/main"
 ZIP_URL = "https://github.com/panicatcks/mailinig-soft/archive/refs/heads/main.zip"
+UPDATE_STATE_FILE = ".update_state.json"
+APP_VERSION_FILE = "APP_VERSION"
 
 
 @dataclass
@@ -26,6 +28,48 @@ class UpdateInfo:
 
 class UpdateError(RuntimeError):
     pass
+
+
+def _read_update_state(base_dir: Path) -> dict:
+    path = base_dir / UPDATE_STATE_FILE
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_update_state(base_dir: Path, commit: str) -> None:
+    path = base_dir / UPDATE_STATE_FILE
+    payload = {"installed_commit": commit}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_app_version(base_dir: Path) -> str:
+    path = base_dir / APP_VERSION_FILE
+    if not path.exists():
+        return ""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    return value
+
+
+def resolve_local_version(base_dir: Path) -> str:
+    git_commit = get_local_commit(base_dir)
+    if git_commit:
+        return git_commit
+    state = _read_update_state(base_dir)
+    installed_commit = str(state.get("installed_commit", "")).strip()
+    if installed_commit:
+        return installed_commit
+    app_version = _read_app_version(base_dir)
+    if app_version:
+        return f"build-{app_version}"
+    return "unknown-local-build"
 
 
 def _urlopen_with_tls_fallback(req: Request, timeout: int = 20):
@@ -84,12 +128,13 @@ def fetch_remote_commit() -> str:
 
 
 def check_for_updates(base_dir: Path) -> UpdateInfo:
-    local_commit = get_local_commit(base_dir)
+    local_commit = resolve_local_version(base_dir)
     remote_commit = fetch_remote_commit()
+    commit_like = bool(re.fullmatch(r"[0-9a-f]{7,12}", local_commit))
     return UpdateInfo(
-        local_commit=local_commit or "нет git-версии",
+        local_commit=local_commit,
         remote_commit=remote_commit,
-        has_update=(not local_commit) or local_commit != remote_commit,
+        has_update=(local_commit != remote_commit) if commit_like else True,
     )
 
 
@@ -155,5 +200,8 @@ def update_with_archive(base_dir: Path) -> str:
 
 def apply_update(base_dir: Path) -> str:
     if git_available() and (base_dir / ".git").exists():
-        return update_with_git(base_dir)
-    return update_with_archive(base_dir)
+        commit = update_with_git(base_dir)
+    else:
+        commit = update_with_archive(base_dir)
+    _write_update_state(base_dir, commit)
+    return commit
