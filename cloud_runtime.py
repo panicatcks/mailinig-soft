@@ -75,6 +75,7 @@ class CloudRuntime:
         self.client: paramiko.SSHClient | None = None
         self.sftp: paramiko.SFTPClient | None = None
         self.current_run_id: str | None = None
+        self.remote_home: str | None = None
 
     def connect(self) -> None:
         if self.client is not None:
@@ -92,6 +93,7 @@ class CloudRuntime:
         )
         self.client = client
         self.sftp = client.open_sftp()
+        self.remote_home = self.sftp.normalize(".")
 
     def close(self) -> None:
         if self.sftp is not None:
@@ -100,11 +102,28 @@ class CloudRuntime:
         if self.client is not None:
             self.client.close()
             self.client = None
+        self.remote_home = None
 
     def _require_client(self) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
         if self.client is None or self.sftp is None:
             raise CloudRuntimeError("Нет активного подключения к серверу.")
         return self.client, self.sftp
+
+    def _resolve_remote_dir(self) -> str:
+        self._require_client()
+        if not self.remote_home:
+            raise CloudRuntimeError("Не удалось определить home директорию на сервере.")
+        raw = (self.config.remote_dir or "").strip() or "~/mailinig-soft-cloud"
+        if raw == "~":
+            return self.remote_home
+        if raw.startswith("~/"):
+            return posixpath.join(self.remote_home, raw[2:])
+        if raw.startswith("/"):
+            return raw
+        return posixpath.join(self.remote_home, raw)
+
+    def get_remote_base_dir(self) -> str:
+        return self._resolve_remote_dir()
 
     def exec(self, command: str, timeout: int = 120) -> tuple[int, str, str]:
         client, _ = self._require_client()
@@ -129,7 +148,7 @@ class CloudRuntime:
 
     def upload_project(self, on_progress=None) -> list[str]:
         _, sftp = self._require_client()
-        remote_root = self.config.remote_dir.rstrip("/")
+        remote_root = self._resolve_remote_dir().rstrip("/")
         self._remote_mkdirs(remote_root)
         uploaded: list[str] = []
         files = iter_project_files(self.base_dir)
@@ -146,7 +165,8 @@ class CloudRuntime:
         return uploaded
 
     def initialize_server(self, on_step=None) -> str:
-        remote_dir = shlex.quote(self.config.remote_dir)
+        remote_dir_abs = self._resolve_remote_dir()
+        remote_dir = shlex.quote(remote_dir_abs)
         password = shlex.quote(self.config.password)
         steps = [
             (
@@ -207,17 +227,24 @@ class CloudRuntime:
         _, _ = self._require_client()
         run_id = uuid.uuid4().hex[:12]
         self.current_run_id = run_id
-        remote_dir = self.config.remote_dir.rstrip("/")
+        remote_dir = self._resolve_remote_dir().rstrip("/")
         runs_dir = f"{remote_dir}/.cloud_runs"
         pid_file = f"{runs_dir}/task_{run_id}.pid"
         log_file = f"{runs_dir}/task_{run_id}.log"
         status_file = f"{runs_dir}/task_{run_id}.exit"
         argv_quoted = " ".join(shlex.quote(token) for token in argv)
+        inner_script = (
+            f"{argv_quoted}; "
+            "rc=$?; "
+            f"echo $rc > {shlex.quote(status_file)}; "
+            f"rm -f {shlex.quote(pid_file)}; "
+            "exit $rc"
+        )
         launch_script = (
             f"set -e; mkdir -p {shlex.quote(runs_dir)}; cd {shlex.quote(remote_dir)}; "
             "export PYTHONUNBUFFERED=1; "
             "if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi; "
-            f"nohup bash -lc '{argv_quoted}; rc=$?; echo $rc > {shlex.quote(status_file)}; rm -f {shlex.quote(pid_file)}; exit $rc' "
+            f"nohup sh -c {shlex.quote(inner_script)} "
             f"> {shlex.quote(log_file)} 2>&1 < /dev/null & "
             "pid=$!; "
             f"echo $pid > {shlex.quote(pid_file)}; "
@@ -248,7 +275,7 @@ class CloudRuntime:
         return code == 0 and "RUNNING" in out
 
     def stop_remote_process(self, run_id: str) -> tuple[bool, str]:
-        runs_dir = f"{self.config.remote_dir.rstrip('/')}/.cloud_runs"
+        runs_dir = f"{self._resolve_remote_dir().rstrip('/')}/.cloud_runs"
         pid_file = f"{runs_dir}/task_{run_id}.pid"
         command = (
             f"if [ -f {shlex.quote(pid_file)} ]; then "

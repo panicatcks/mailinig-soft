@@ -16,7 +16,7 @@ import ssl
 import shlex
 from datetime import date, datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -27,6 +27,7 @@ from self_update import apply_update, check_for_updates
 
 APP_TITLE = "SMTP Рассылка — ПРОМТЕХРЕШЕНИЯ"
 CONFIG_PATH = Path(__file__).resolve().parent / "mailer_gui_config.json"
+PROFILES_PATH = Path(__file__).resolve().parent / "mailer_profiles.json"
 SCRIPT_PATH = Path(__file__).resolve().parent / "send_email.py"
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -59,6 +60,7 @@ class MailerApp:
         self._build_ui()
         self._bind_state_traces()
         self._load_config()
+        self._refresh_profile_controls()
         if not self.to_file_var.get().strip():
             self._auto_pick_to_file(silent=True)
         if not self.template_var.get().strip():
@@ -144,6 +146,99 @@ class MailerApp:
                 data = {}
         data["cloud_last_task"] = self.remote_task_meta or {}
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _read_profiles_store(self) -> dict:
+        if not PROFILES_PATH.exists():
+            return {"active": "", "profiles": {}}
+        try:
+            data = json.loads(PROFILES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"active": "", "profiles": {}}
+        if not isinstance(data, dict):
+            return {"active": "", "profiles": {}}
+        profiles = data.get("profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+        active = data.get("active", "")
+        return {"active": str(active), "profiles": profiles}
+
+    def _write_profiles_store(self, store: dict) -> None:
+        PROFILES_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _refresh_profile_controls(self, selected: str | None = None) -> None:
+        store = self._read_profiles_store()
+        names = sorted(store.get("profiles", {}).keys())
+        self.profile_combo.configure(values=names)
+        target = selected if selected is not None else store.get("active", "")
+        if target in names:
+            self.profile_var.set(target)
+        elif names:
+            self.profile_var.set(names[0])
+        else:
+            self.profile_var.set("")
+
+    def _save_profile_as(self) -> None:
+        name = simpledialog.askstring("Сохранить профиль", "Название профиля:")
+        if not name:
+            return
+        profile_name = name.strip()
+        if not profile_name:
+            return
+        store = self._read_profiles_store()
+        profiles = store.setdefault("profiles", {})
+        profiles[profile_name] = self._collect_settings_data(include_runtime=False)
+        store["active"] = profile_name
+        self._write_profiles_store(store)
+        self._refresh_profile_controls(selected=profile_name)
+        self._append_log(f"\nПрофиль сохранен: {profile_name}\n")
+
+    def _save_profile_overwrite(self) -> None:
+        profile_name = self.profile_var.get().strip()
+        if not profile_name:
+            self._save_profile_as()
+            return
+        store = self._read_profiles_store()
+        profiles = store.setdefault("profiles", {})
+        profiles[profile_name] = self._collect_settings_data(include_runtime=False)
+        store["active"] = profile_name
+        self._write_profiles_store(store)
+        self._refresh_profile_controls(selected=profile_name)
+        self._append_log(f"\nПрофиль обновлен: {profile_name}\n")
+
+    def _load_selected_profile(self) -> None:
+        profile_name = self.profile_var.get().strip()
+        if not profile_name:
+            messagebox.showinfo("Профили", "Выберите профиль.")
+            return
+        store = self._read_profiles_store()
+        profiles = store.get("profiles", {})
+        data = profiles.get(profile_name)
+        if not isinstance(data, dict):
+            messagebox.showerror("Профили", "Профиль не найден.")
+            return
+        self._apply_settings_data(data)
+        store["active"] = profile_name
+        self._write_profiles_store(store)
+        self._refresh_profile_controls(selected=profile_name)
+        self._set_settings_dirty(False)
+        self._append_log(f"\nПрофиль загружен: {profile_name}\n")
+
+    def _delete_selected_profile(self) -> None:
+        profile_name = self.profile_var.get().strip()
+        if not profile_name:
+            messagebox.showinfo("Профили", "Выберите профиль.")
+            return
+        if not messagebox.askyesno("Профили", f"Удалить профиль '{profile_name}'?"):
+            return
+        store = self._read_profiles_store()
+        profiles = store.get("profiles", {})
+        if profile_name in profiles:
+            del profiles[profile_name]
+        if store.get("active", "") == profile_name:
+            store["active"] = ""
+        self._write_profiles_store(store)
+        self._refresh_profile_controls()
+        self._append_log(f"\nПрофиль удален: {profile_name}\n")
 
     def _on_refresh_trigger(self, *_args) -> None:
         self._refresh_state_info()
@@ -411,6 +506,16 @@ class MailerApp:
         ttk.Button(actions, text="Проверить", command=self._start_dry_run).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(actions, text="Отправить", command=self._start_send).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(actions, text="Стоп", command=self._stop_process).grid(row=0, column=3, padx=(8, 0))
+        ttk.Label(actions, text="Профиль:").grid(row=0, column=4, padx=(14, 4))
+        self.profile_var = tk.StringVar(value="")
+        self.profile_combo = ttk.Combobox(actions, textvariable=self.profile_var, width=22, state="readonly")
+        self.profile_combo.grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(actions, text="Сохранить как", command=self._save_profile_as).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(actions, text="Сохранить в профиль", command=self._save_profile_overwrite).grid(row=0, column=7, padx=(0, 6))
+        ttk.Button(actions, text="Загрузить профиль", command=self._load_selected_profile).grid(row=0, column=8, padx=(0, 6))
+        ttk.Button(actions, text="Удалить профиль", command=self._delete_selected_profile).grid(row=0, column=9)
+        self.profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_selected_profile())
+        self._refresh_profile_controls()
 
         state_frame = ttk.LabelFrame(frame, text="Состояние отправки (state)", padding=10)
         state_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -1148,8 +1253,9 @@ class MailerApp:
                 mask_next = True
         return " ".join(safe)
 
-    def _build_remote_command(self, cmd: list[str]) -> list[str]:
+    def _build_remote_command(self, cmd: list[str], remote_base_dir: str) -> list[str]:
         remote_cmd: list[str] = []
+        remote_base = remote_base_dir.rstrip("/")
         for token in cmd:
             if token == "python3":
                 remote_cmd.append("python3")
@@ -1160,10 +1266,10 @@ class MailerApp:
                 remote_cmd.append(token)
                 continue
             if path == SCRIPT_PATH:
-                remote_cmd.append(f"{self.server_remote_dir_var.get().strip().rstrip('/')}/send_email.py")
+                remote_cmd.append(f"{remote_base}/send_email.py")
             elif path.is_relative_to(BASE_DIR):
                 relative = path.relative_to(BASE_DIR).as_posix()
-                remote_cmd.append(f"{self.server_remote_dir_var.get().strip().rstrip('/')}/{relative}")
+                remote_cmd.append(f"{remote_base}/{relative}")
             else:
                 remote_cmd.append(token)
         return remote_cmd
@@ -1347,7 +1453,7 @@ class MailerApp:
                     runtime = self._ensure_cloud_runtime()
                     self.log_queue.put("[Cloud] Синхронизация файлов проекта...\n")
                     runtime.upload_project()
-                    remote_cmd = self._build_remote_command(cmd)
+                    remote_cmd = self._build_remote_command(cmd, runtime.get_remote_base_dir())
                     self.log_queue.put("[Cloud] Запуск задачи на сервере (detached)...\n")
                     task = runtime.start_remote_process_detached(remote_cmd)
                     self.remote_run_id = task["run_id"]
@@ -1422,7 +1528,7 @@ class MailerApp:
 
         self._append_log("\nНет активного процесса.\n")
 
-    def _save_config(self) -> None:
+    def _collect_settings_data(self, include_runtime: bool) -> dict:
         data = {
             "template": self.template_var.get().strip(),
             "subject": self.subject_var.get().strip(),
@@ -1456,23 +1562,14 @@ class MailerApp:
             "server_user": self.server_user_var.get().strip(),
             "server_password": self.server_password_var.get().strip(),
             "server_remote_dir": self.server_remote_dir_var.get().strip(),
-            "cloud_last_task": self.remote_task_meta or {},
             "dry_run": self.dry_run_var.get(),
             "test_email": self.test_email_var.get().strip(),
         }
-        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._append_log(f"\nНастройки сохранены: {CONFIG_PATH}\n")
-        self._refresh_state_info()
-        self._set_settings_dirty(False)
+        if include_runtime:
+            data["cloud_last_task"] = self.remote_task_meta or {}
+        return data
 
-    def _load_config(self) -> None:
-        if not CONFIG_PATH.exists():
-            return
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return
-
+    def _apply_settings_data(self, data: dict) -> None:
         previous_suspend = self._suspend_dirty_tracking
         self._suspend_dirty_tracking = True
         try:
@@ -1517,11 +1614,30 @@ class MailerApp:
             if self.remote_task_meta and self.remote_task_meta.get("run_id"):
                 self.remote_run_id = str(self.remote_task_meta.get("run_id"))
                 self.cloud_status_var.set(f"Найдена задача: {self.remote_run_id}")
+            else:
+                self.remote_run_id = None
             self.dry_run_var.set(bool(data.get("dry_run", False)))
             self.test_email_var.set(data.get("test_email", ""))
             self._refresh_state_info()
         finally:
             self._suspend_dirty_tracking = previous_suspend
+
+    def _save_config(self) -> None:
+        data = self._collect_settings_data(include_runtime=True)
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._append_log(f"\nНастройки сохранены: {CONFIG_PATH}\n")
+        self._refresh_state_info()
+        self._set_settings_dirty(False)
+
+    def _load_config(self) -> None:
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(data, dict):
+            self._apply_settings_data(data)
 
 
 def main() -> None:
