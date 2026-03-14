@@ -30,6 +30,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "mailer_gui_config.json"
 PROFILES_PATH = Path(__file__).resolve().parent / "mailer_profiles.json"
 SCRIPT_PATH = Path(__file__).resolve().parent / "send_email.py"
 BASE_DIR = Path(__file__).resolve().parent
+PROFILE_STATE_DIR = BASE_DIR / "state_profiles"
 
 
 class MailerApp:
@@ -96,6 +97,18 @@ class MailerApp:
         self.settings_dirty = value
         suffix = " *" if value else ""
         self.root.title(APP_TITLE + suffix)
+
+    def _profile_state_path(self, profile_name: str) -> Path:
+        safe_name = self._sanitize_filename_part(profile_name).lower() or "profile"
+        PROFILE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        return PROFILE_STATE_DIR / f"{safe_name}.json"
+
+    def _ensure_profile_state_data(self, profile_name: str, data: dict) -> dict:
+        profile_data = dict(data)
+        current = str(profile_data.get("state_file", "")).strip()
+        if not current:
+            profile_data["state_file"] = str(self._profile_state_path(profile_name))
+        return profile_data
 
     def _sanitize_filename_part(self, text: str) -> str:
         value = re.sub(r"[^\w\-\.]+", "_", text.strip(), flags=re.UNICODE).strip("._")
@@ -167,7 +180,18 @@ class MailerApp:
 
     def _refresh_profile_controls(self, selected: str | None = None) -> None:
         store = self._read_profiles_store()
-        names = sorted(store.get("profiles", {}).keys())
+        profiles = store.get("profiles", {})
+        changed = False
+        if isinstance(profiles, dict):
+            for name, payload in list(profiles.items()):
+                if isinstance(payload, dict):
+                    normalized = self._ensure_profile_state_data(name, payload)
+                    if normalized != payload:
+                        profiles[name] = normalized
+                        changed = True
+        if changed:
+            self._write_profiles_store(store)
+        names = sorted(profiles.keys()) if isinstance(profiles, dict) else []
         self.profile_combo.configure(values=names)
         target = selected if selected is not None else store.get("active", "")
         if target in names:
@@ -186,7 +210,8 @@ class MailerApp:
             return
         store = self._read_profiles_store()
         profiles = store.setdefault("profiles", {})
-        profiles[profile_name] = self._collect_settings_data(include_runtime=False)
+        data = self._collect_settings_data(include_runtime=False)
+        profiles[profile_name] = self._ensure_profile_state_data(profile_name, data)
         store["active"] = profile_name
         self._write_profiles_store(store)
         self._refresh_profile_controls(selected=profile_name)
@@ -199,7 +224,12 @@ class MailerApp:
             return
         store = self._read_profiles_store()
         profiles = store.setdefault("profiles", {})
-        profiles[profile_name] = self._collect_settings_data(include_runtime=False)
+        current = profiles.get(profile_name, {})
+        data = self._collect_settings_data(include_runtime=False)
+        if isinstance(current, dict):
+            if "state_file" in current and str(current.get("state_file", "")).strip():
+                data["state_file"] = str(current.get("state_file", "")).strip()
+        profiles[profile_name] = self._ensure_profile_state_data(profile_name, data)
         store["active"] = profile_name
         self._write_profiles_store(store)
         self._refresh_profile_controls(selected=profile_name)
@@ -216,7 +246,9 @@ class MailerApp:
         if not isinstance(data, dict):
             messagebox.showerror("Профили", "Профиль не найден.")
             return
-        self._apply_settings_data(data)
+        normalized = self._ensure_profile_state_data(profile_name, data)
+        profiles[profile_name] = normalized
+        self._apply_settings_data(normalized)
         store["active"] = profile_name
         self._write_profiles_store(store)
         self._refresh_profile_controls(selected=profile_name)
