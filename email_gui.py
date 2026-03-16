@@ -1288,22 +1288,39 @@ class MailerApp:
     def _build_remote_command(self, cmd: list[str], remote_base_dir: str) -> list[str]:
         remote_cmd: list[str] = []
         remote_base = remote_base_dir.rstrip("/")
-        for token in cmd:
-            if token == "python3":
+        path_flags = {"--template", "--to-file", "--state-file"}
+        previous_flag = ""
+
+        def map_local_path(raw: str) -> str:
+            path = Path(raw).expanduser()
+            if not path.exists():
+                return raw
+            resolved = path.resolve()
+            if resolved == SCRIPT_PATH:
+                return f"{remote_base}/send_email.py"
+            if resolved.is_relative_to(BASE_DIR):
+                relative = resolved.relative_to(BASE_DIR).as_posix()
+                return f"{remote_base}/{relative}"
+            return raw
+
+        for index, token in enumerate(cmd):
+            if index == 0 and token == "python3":
                 remote_cmd.append("python3")
+                previous_flag = ""
                 continue
-            try:
-                path = Path(token).expanduser().resolve()
-            except Exception:
+            if index == 1:
+                remote_cmd.append(map_local_path(token))
+                previous_flag = ""
+                continue
+            if token.startswith("--"):
                 remote_cmd.append(token)
+                previous_flag = token
                 continue
-            if path == SCRIPT_PATH:
-                remote_cmd.append(f"{remote_base}/send_email.py")
-            elif path.is_relative_to(BASE_DIR):
-                relative = path.relative_to(BASE_DIR).as_posix()
-                remote_cmd.append(f"{remote_base}/{relative}")
+            if previous_flag in path_flags:
+                remote_cmd.append(map_local_path(token))
             else:
                 remote_cmd.append(token)
+            previous_flag = ""
         return remote_cmd
 
     def _ensure_cloud_runtime(self) -> CloudRuntime:
