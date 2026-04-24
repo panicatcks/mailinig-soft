@@ -83,12 +83,32 @@ class RecipientRow:
     source_row: int | None = None
 
 
+@dataclass
+class SmtpAccount:
+    host: str
+    port: int
+    user: str
+    password: str
+    from_email: str
+    daily_limit: int | None = None
+    label: str = ""
+
+    @property
+    def key(self) -> str:
+        return (self.user or self.from_email or self.label).strip().lower()
+
+    @property
+    def display_name(self) -> str:
+        return self.label or self.from_email or self.user or self.host
+
+
 class SendingState:
     def __init__(self, state_path: Path, campaign_key: str):
         self.state_path = state_path
         self.campaign_key = campaign_key
         self.current_date = date.today().isoformat()
         self.sent_today = 0
+        self.account_sent_today: dict[str, int] = {}
         self.cursor_index = 0
         self.last_row = 0
         self.raw_data: dict = {}
@@ -111,8 +131,16 @@ class SendingState:
         previous_date = str(data.get("date", ""))
         if previous_date == self.current_date:
             self.sent_today = int(data.get("sent_today", 0))
+            raw_accounts = data.get("account_sent_today", {})
+            if isinstance(raw_accounts, dict):
+                self.account_sent_today = {
+                    str(key): int(value)
+                    for key, value in raw_accounts.items()
+                    if str(key).strip()
+                }
         else:
             self.sent_today = 0
+            self.account_sent_today = {}
 
         campaigns = data.get("campaigns", {})
         if isinstance(campaigns, dict):
@@ -126,6 +154,7 @@ class SendingState:
     def save(self) -> None:
         self.raw_data["date"] = self.current_date
         self.raw_data["sent_today"] = self.sent_today
+        self.raw_data["account_sent_today"] = self.account_sent_today
         campaigns = self.raw_data.setdefault("campaigns", {})
         campaigns[self.campaign_key] = {
             "cursor_index": self.cursor_index,
@@ -142,6 +171,32 @@ class SendingState:
         if source_row is not None:
             self.last_row = max(source_row, 0)
         self.save()
+
+    def mark_account_sent(self, account: SmtpAccount) -> None:
+        key = account.key
+        if key:
+            self.account_sent_today[key] = self.account_sent_today.get(key, 0) + 1
+        self.sent_today += 1
+
+
+class ProgressReporter:
+    def __init__(self, path: str | None):
+        self.path = Path(path).expanduser().resolve() if path else None
+
+    def write(self, **payload: object) -> None:
+        if not self.path:
+            return
+        data = {
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **payload,
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(self.path)
+        except Exception as error:
+            print(f"Не удалось записать progress-файл: {error}")
 
 
 class RateLimiter:
@@ -252,6 +307,11 @@ def parse_args() -> argparse.Namespace:
         help="Файл состояния для суточного лимита.",
     )
     parser.add_argument(
+        "--progress-file",
+        default="",
+        help="JSON-файл статуса выполнения для GUI/облака.",
+    )
+    parser.add_argument(
         "--hub-url",
         default="",
         help="Базовый URL Mailroute Hub для трекинг-пикселя (например: https://hub.example.com).",
@@ -304,6 +364,16 @@ def parse_args() -> argparse.Namespace:
         help="Email отправителя (по умолчанию = smtp-user).",
     )
     parser.add_argument(
+        "--smtp-account",
+        action="append",
+        default=[],
+        help=(
+            "Дополнительный SMTP аккаунт в JSON: "
+            '{"host":"smtp.timeweb.ru","port":465,"user":"...","password":"...",'
+            '"from_email":"...","daily_limit":2000,"label":"domain.ru"}'
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Проверить сборку писем без реальной отправки.",
@@ -322,6 +392,55 @@ def parse_columns(raw: str) -> list[str]:
     if not raw.strip():
         return []
     return [normalize_col_name(chunk) for chunk in raw.split(",") if chunk.strip()]
+
+
+def parse_smtp_accounts(args: argparse.Namespace) -> list[SmtpAccount]:
+    accounts: list[SmtpAccount] = []
+    if args.smtp_account:
+        for raw in args.smtp_account[:5]:
+            try:
+                payload = json.loads(raw)
+            except Exception as error:
+                raise RuntimeError(f"Некорректный --smtp-account JSON: {error}") from error
+            if not isinstance(payload, dict):
+                raise RuntimeError("--smtp-account должен быть JSON-объектом.")
+            user = str(payload.get("user") or payload.get("smtp_user") or "").strip()
+            password = str(payload.get("password") or payload.get("smtp_password") or "").strip()
+            from_email = str(payload.get("from_email") or payload.get("from") or user).strip()
+            host = str(payload.get("host") or payload.get("smtp_host") or args.smtp_host).strip()
+            port = int(payload.get("port") or payload.get("smtp_port") or args.smtp_port)
+            daily_limit_raw = payload.get("daily_limit", args.limit_per_day)
+            daily_limit = int(daily_limit_raw) if daily_limit_raw not in (None, "") else None
+            label = str(payload.get("label") or "").strip()
+            if not user or not password:
+                raise RuntimeError("--smtp-account: заполните user и password.")
+            accounts.append(
+                SmtpAccount(
+                    host=host,
+                    port=port,
+                    user=user,
+                    password=password,
+                    from_email=from_email or user,
+                    daily_limit=daily_limit,
+                    label=label,
+                )
+            )
+    else:
+        user = args.smtp_user
+        password = args.smtp_password
+        from_email = args.from_email or user or "no-reply@example.com"
+        accounts.append(
+            SmtpAccount(
+                host=args.smtp_host,
+                port=args.smtp_port,
+                user=user or "",
+                password=password or "",
+                from_email=from_email,
+                daily_limit=args.limit_per_day,
+                label=from_email,
+            )
+        )
+    return accounts
 
 
 def extract_emails(text: str) -> list[str]:
@@ -826,6 +945,7 @@ def send_campaign_report_to_hub(
 
 def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_path: Path) -> None:
     print(f"Build marker: {BUILD_MARKER}")
+    progress = ProgressReporter(args.progress_file)
     templates_cache: dict[Path, tuple[str, str, Path]] = {}
 
     def get_template_content(current_template_path: Path) -> tuple[str, str, Path]:
@@ -841,9 +961,10 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
     _, initial_subject, _ = get_template_content(template_path)
     subject_template = args.subject or initial_subject
 
-    smtp_user = args.smtp_user
-    smtp_password = args.smtp_password
-    from_email = args.from_email or smtp_user or "no-reply@example.com"
+    accounts = parse_smtp_accounts(args)
+    if len(accounts) > 5:
+        raise RuntimeError("Можно указать не более 5 SMTP аккаунтов.")
+    from_email = accounts[0].from_email
     campaign_key = build_campaign_key(args, template_path)
     state = SendingState(Path(args.state_file).expanduser().resolve(), campaign_key=campaign_key)
     limiter = RateLimiter(args.limit_per_minute)
@@ -852,7 +973,12 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         raise RuntimeError("--limit-per-day должен быть > 0")
     if args.limit_per_minute is not None and args.limit_per_minute <= 0:
         raise RuntimeError("--limit-per-minute должен быть > 0")
-    if args.limit_per_day is not None and state.sent_today >= args.limit_per_day:
+    active_accounts = [
+        account
+        for account in accounts
+        if account.daily_limit is None or state.account_sent_today.get(account.key, 0) < account.daily_limit
+    ]
+    if not active_accounts:
         wait_text = format_wait_until_midnight()
         raise RuntimeError(f"ratelimit wait {wait_text}")
 
@@ -861,8 +987,37 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
     start_cursor = max(state.cursor_index, 0)
     if start_cursor >= len(recipients):
         print("Все строки для этой базы уже отправлены. Сбросьте state-файл для повтора.")
+        progress.write(
+            status="completed",
+            total=0,
+            processed=0,
+            sent=0,
+            failed=0,
+            skipped=0,
+            percent=100,
+            message="Все строки уже отправлены.",
+        )
         return
     recipients = recipients[start_cursor:]
+    total_to_process = len(recipients)
+    print(f"Всего получателей (осталось): {total_to_process}")
+    print("SMTP аккаунты:")
+    for account in accounts:
+        sent_for_account = state.account_sent_today.get(account.key, 0)
+        limit_view = "без лимита" if account.daily_limit is None else str(account.daily_limit)
+        print(f"  - {account.display_name}: сегодня {sent_for_account}/{limit_view}")
+    progress.write(
+        status="starting",
+        total=total_to_process,
+        processed=0,
+        sent=0,
+        failed=0,
+        skipped=0,
+        percent=0,
+        template=str(template_path),
+        accounts=[account.display_name for account in accounts],
+        message="Подготовка отправки.",
+    )
 
     if args.dry_run:
         preview = recipients[:3]
@@ -894,38 +1049,69 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
             )
         return
 
-    if not smtp_user or not smtp_password:
+    if any(not account.user or not account.password for account in accounts):
         raise RuntimeError(
             "Нужны SMTP логин и пароль. Передайте --smtp-user/--smtp-password "
-            "или установите SMTP_USER/SMTP_PASSWORD."
+            "или заполните SMTP аккаунты."
         )
 
     sent = 0
     failed = 0
     skipped_daily = 0
-    total_to_process = len(recipients)
     run_status = "completed"
+    current_account: SmtpAccount | None = None
+    smtp: smtplib.SMTP_SSL | None = None
 
-    smtp = smtplib.SMTP_SSL(args.smtp_host, args.smtp_port, timeout=120)
+    def close_smtp() -> None:
+        nonlocal smtp
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
+        smtp = None
+
+    def pick_next_account() -> SmtpAccount | None:
+        for account in accounts:
+            if account.daily_limit is None:
+                return account
+            if state.account_sent_today.get(account.key, 0) < account.daily_limit:
+                return account
+        return None
+
+    def connect_account(account: SmtpAccount) -> smtplib.SMTP_SSL:
+        connection = smtplib.SMTP_SSL(account.host, account.port, timeout=120)
+        connection.login(account.user, account.password)
+        return connection
+
     try:
-        smtp.login(smtp_user, smtp_password)
-
         for offset, recipient in enumerate(recipients, start=1):
+            processed = offset - 1
             if STOP_REQUESTED:
                 run_status = "stopped"
                 skipped_daily = len(recipients) - (offset - 1)
                 print("Остановка подтверждена. Завершаю рассылку после текущего состояния.")
                 break
-            if args.limit_per_day is not None and state.sent_today >= args.limit_per_day:
+            account = pick_next_account()
+            if account is None:
                 skipped_daily = len(recipients) - (offset - 1)
                 break
+            if current_account is None or current_account.key != account.key:
+                close_smtp()
+                current_account = account
+                print(f"Переключение SMTP аккаунта: {account.display_name}")
+                smtp = connect_account(account)
 
             limiter.wait_for_slot()
             kind = recipient.fields.get("KIND", "")
             row_template_path = pick_template_by_kind(template_path, kind) if kind else template_path
+            if not row_template_path.exists():
+                raise RuntimeError(f"HTML-шаблон не найден: {row_template_path}")
             row_html_template, _, row_template_dir = get_template_content(row_template_path)
             personalized_html = replace_placeholders(row_html_template, recipient.fields)
             personalized_html = make_email_friendly_html(personalized_html)
+            if not personalized_html.strip():
+                raise RuntimeError(f"HTML-шаблон пустой: {row_template_path}")
             message_id = uuid.uuid4().hex
             if args.hub_url and args.hub_connection_id > 0 and args.hub_module_secret:
                 pixel_url = build_open_pixel_url(
@@ -940,7 +1126,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
                 personalized_html = add_tracking_pixel(personalized_html, pixel_url)
             personalized_subject = replace_placeholders(subject_template, recipient.fields)
             message = build_message(
-                from_email=from_email,
+                from_email=account.from_email,
                 recipient_email=recipient.email,
                 subject=personalized_subject,
                 html=personalized_html,
@@ -951,6 +1137,8 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
             last_error: Exception | None = None
             for attempt in range(1, 4):
                 try:
+                    if smtp is None:
+                        smtp = connect_account(account)
                     smtp.send_message(message)
                     last_error = None
                     break
@@ -959,27 +1147,56 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
                     print(f"Ошибка отправки ({attempt}/3) для {recipient.email}: {error}")
                     time.sleep(2)
                     try:
-                        smtp.quit()
+                        if smtp is not None:
+                            smtp.quit()
                     except Exception:
                         pass
-                    smtp = smtplib.SMTP_SSL(args.smtp_host, args.smtp_port, timeout=120)
-                    smtp.login(smtp_user, smtp_password)
+                    smtp = connect_account(account)
 
             if last_error:
                 failed += 1
                 print(f"[ERR] Не отправлено: {recipient.email} | причина: {last_error}")
+                progress.write(
+                    status="running",
+                    total=total_to_process,
+                    processed=min(processed + 1, total_to_process),
+                    sent=sent,
+                    failed=failed,
+                    skipped=skipped_daily,
+                    percent=round((min(processed + 1, total_to_process) / total_to_process) * 100, 2),
+                    current_email=recipient.email,
+                    current_template=str(row_template_path),
+                    current_account=account.display_name,
+                    message=f"Ошибка отправки: {recipient.email}",
+                )
                 continue
 
             limiter.mark_sent()
             sent += 1
-            state.sent_today += 1
+            state.mark_account_sent(account)
             state.advance_cursor(start_cursor + offset, recipient.source_row)
-            print(f"[{sent}] Отправлено: {recipient.email} | шаблон: {row_template_path.name}")
+            processed = offset
+            percent = round((processed / total_to_process) * 100, 2) if total_to_process else 100
+            print(
+                f"[{sent}] Отправлено: {recipient.email} | "
+                f"шаблон: {row_template_path.name} | аккаунт: {account.display_name} | {percent}%"
+            )
+            progress.write(
+                status="running",
+                total=total_to_process,
+                processed=processed,
+                sent=sent,
+                failed=failed,
+                skipped=skipped_daily,
+                percent=percent,
+                current_email=recipient.email,
+                current_template=str(row_template_path),
+                current_account=account.display_name,
+                account_sent_today=state.account_sent_today,
+                message=f"Отправлено {sent} из {total_to_process}.",
+            )
     finally:
-        try:
-            smtp.quit()
-        except Exception:
-            pass
+        close_smtp()
 
     print(f"Готово. Отправлено: {sent}.")
     print(f"Статус выполнения: {run_status}")
@@ -988,6 +1205,18 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
             f"Пропущено из-за суточного лимита: {skipped_daily}. "
             "Запустите снова завтра или увеличьте --limit-per-day."
         )
+    final_processed = min(sent + failed + skipped_daily, total_to_process)
+    progress.write(
+        status=run_status,
+        total=total_to_process,
+        processed=final_processed,
+        sent=sent,
+        failed=failed,
+        skipped=skipped_daily,
+        percent=round((final_processed / total_to_process) * 100, 2) if total_to_process else 100,
+        account_sent_today=state.account_sent_today,
+        message=f"Готово. Отправлено: {sent}.",
+    )
 
     run_finished_at = datetime.now()
     if args.hub_url and args.hub_connection_id > 0 and args.hub_module_secret:

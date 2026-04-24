@@ -289,7 +289,10 @@ class CloudRuntime:
     def download_text_file(self, remote_path: str) -> str:
         _, sftp = self._require_client()
         with sftp.open(remote_path, "r") as handle:
-            return handle.read().decode("utf-8", errors="replace")
+            data = handle.read()
+            if isinstance(data, (bytes, bytearray)):
+                return data.decode("utf-8", errors="replace")
+            return str(data)
 
     def upload_text_file(self, remote_path: str, content: str) -> None:
         _, sftp = self._require_client()

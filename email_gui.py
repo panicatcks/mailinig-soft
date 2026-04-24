@@ -56,6 +56,7 @@ class MailerApp:
         self.settings_dirty = False
         self._suspend_dirty_tracking = True
         self.server_init_in_progress = False
+        self.smtp_accounts: list[dict] = []
 
         self._setup_style()
         self._build_ui()
@@ -491,6 +492,74 @@ class MailerApp:
         ttk.Checkbutton(frame, text="Только проверка (dry-run)", variable=self.dry_run_var).grid(
             row=3, column=4, columnspan=4, sticky="w", padx=(12, 0), pady=(8, 0)
         )
+        ttk.Button(frame, text="SMTP аккаунты до 5", command=self._edit_smtp_accounts).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+    def _edit_smtp_accounts(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("SMTP аккаунты")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("980x300")
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        headers = ["Вкл", "Название/домен", "Host", "Порт", "Логин", "Пароль", "From", "Лимит/день"]
+        for col, title in enumerate(headers):
+            ttk.Label(frame, text=title).grid(row=0, column=col, sticky="w", padx=4)
+            frame.columnconfigure(col, weight=1 if col in (1, 2, 4, 5, 6) else 0)
+
+        rows = []
+        current = list(self.smtp_accounts)
+        while len(current) < 5:
+            current.append({})
+        for idx in range(5):
+            item = current[idx]
+            enabled = tk.BooleanVar(value=bool(item.get("enabled", idx == 0 and not self.smtp_accounts)))
+            label = tk.StringVar(value=str(item.get("label", "")))
+            host = tk.StringVar(value=str(item.get("host", self.smtp_host_var.get().strip() or "smtp.timeweb.ru")))
+            port = tk.StringVar(value=str(item.get("port", self.smtp_port_var.get().strip() or "465")))
+            user = tk.StringVar(value=str(item.get("user", "")))
+            password = tk.StringVar(value=str(item.get("password", "")))
+            from_email = tk.StringVar(value=str(item.get("from_email", "")))
+            daily_limit = tk.StringVar(value=str(item.get("daily_limit", self.limit_day_var.get().strip() or "2000")))
+            values = [enabled, label, host, port, user, password, from_email, daily_limit]
+            ttk.Checkbutton(frame, variable=enabled).grid(row=idx + 1, column=0, padx=4, pady=4)
+            for col, var in enumerate(values[1:], start=1):
+                show = "*" if col == 5 else ""
+                entry = ttk.Entry(frame, textvariable=var, show=show, width=12)
+                entry.grid(row=idx + 1, column=col, sticky="ew", padx=4, pady=4)
+                if col == 5:
+                    self._add_paste_support(entry)
+            rows.append(values)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=6, column=0, columnspan=8, sticky="e", pady=(12, 0))
+
+        def save() -> None:
+            accounts = []
+            for enabled, label, host, port, user, password, from_email, daily_limit in rows:
+                if not enabled.get():
+                    continue
+                payload = {
+                    "enabled": True,
+                    "label": label.get().strip(),
+                    "host": host.get().strip() or "smtp.timeweb.ru",
+                    "port": port.get().strip() or "465",
+                    "user": user.get().strip(),
+                    "password": password.get().strip(),
+                    "from_email": from_email.get().strip() or user.get().strip(),
+                    "daily_limit": daily_limit.get().strip() or "2000",
+                }
+                if payload["user"] and payload["password"]:
+                    accounts.append(payload)
+            self.smtp_accounts = accounts[:5]
+            self._set_settings_dirty(True)
+            self._append_log(f"\nSMTP аккаунты обновлены: {len(self.smtp_accounts)} активн.\n")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Сохранить", command=save).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Отмена", command=dialog.destroy).grid(row=0, column=1)
 
     def _build_log_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Лог выполнения", padding=10)
@@ -1176,6 +1245,51 @@ class MailerApp:
             self._finalize_progress_ui()
             return
 
+    def _apply_progress_payload(self, payload: dict) -> None:
+        total = self._safe_int(str(payload.get("total", 0)), 0)
+        sent = self._safe_int(str(payload.get("sent", 0)), 0)
+        failed = self._safe_int(str(payload.get("failed", 0)), 0)
+        skipped = self._safe_int(str(payload.get("skipped", 0)), 0)
+        processed = self._safe_int(str(payload.get("processed", sent + failed + skipped)), sent + failed + skipped)
+        self.progress_total = total
+        self.progress_sent = sent
+        self.progress_failed = failed
+        self.progress_skipped = skipped
+        if total > 0:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", maximum=total, value=min(processed, total))
+            percent = payload.get("percent")
+            percent_view = f"{percent}%" if percent not in (None, "") else f"{round(processed / total * 100, 2)}%"
+            account = str(payload.get("current_account", "")).strip()
+            suffix = f" | {account}" if account else ""
+            self.progress_text_var.set(
+                f"Прогресс: {processed}/{total} ({percent_view}) ok:{sent} err:{failed} skip:{skipped}{suffix}"
+            )
+        else:
+            self._apply_progress_ui()
+        status = str(payload.get("status", "")).lower()
+        if status in {"completed", "stopped", "failed"}:
+            self._finalize_progress_ui()
+
+    def _read_remote_progress_payload(self, runtime: CloudRuntime, progress_file: str) -> dict | None:
+        if not progress_file:
+            return None
+        try:
+            raw = runtime.download_text_file(progress_file)
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _extract_flag_value(self, cmd: list[str], flag: str) -> str:
+        try:
+            index = cmd.index(flag)
+        except ValueError:
+            return ""
+        if index + 1 >= len(cmd):
+            return ""
+        return cmd[index + 1]
+
     def _collect_command(
         self,
         force_dry_run: bool | None = None,
@@ -1266,6 +1380,36 @@ class MailerApp:
         for email in manual_to:
             cmd.extend(["--to", email])
 
+        active_accounts = [
+            item
+            for item in self.smtp_accounts
+            if item.get("enabled", True) and str(item.get("user", "")).strip() and str(item.get("password", "")).strip()
+        ]
+        if active_accounts:
+            cleaned: list[str] = []
+            skip_next = False
+            single_flags = {"--smtp-host", "--smtp-port", "--smtp-user", "--smtp-password", "--from-email"}
+            for token in cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if token in single_flags:
+                    skip_next = True
+                    continue
+                cleaned.append(token)
+            cmd = cleaned
+            for account in active_accounts[:5]:
+                payload = {
+                    "label": str(account.get("label", "")).strip(),
+                    "host": str(account.get("host", "smtp.timeweb.ru")).strip() or "smtp.timeweb.ru",
+                    "port": int(self._safe_int(str(account.get("port", "465")), 465)),
+                    "user": str(account.get("user", "")).strip(),
+                    "password": str(account.get("password", "")).strip(),
+                    "from_email": str(account.get("from_email", "")).strip() or str(account.get("user", "")).strip(),
+                    "daily_limit": int(self._safe_int(str(account.get("daily_limit", "2000")), 2000)),
+                }
+                cmd.extend(["--smtp-account", json.dumps(payload, ensure_ascii=False)])
+
         dry_run = self.dry_run_var.get() if force_dry_run is None else force_dry_run
         if dry_run:
             cmd.append("--dry-run")
@@ -1281,20 +1425,18 @@ class MailerApp:
                 mask_next = False
                 continue
             safe.append(token)
-            if token == "--smtp-password":
+            if token in {"--smtp-password", "--smtp-account"}:
                 mask_next = True
         return " ".join(safe)
 
     def _build_remote_command(self, cmd: list[str], remote_base_dir: str) -> list[str]:
         remote_cmd: list[str] = []
         remote_base = remote_base_dir.rstrip("/")
-        path_flags = {"--template", "--to-file", "--state-file"}
+        path_flags = {"--template", "--to-file", "--state-file", "--progress-file"}
         previous_flag = ""
 
         def map_local_path(raw: str) -> str:
             path = Path(raw).expanduser()
-            if not path.exists():
-                return raw
             resolved = path.resolve()
             if resolved == SCRIPT_PATH:
                 return f"{remote_base}/send_email.py"
@@ -1351,6 +1493,16 @@ class MailerApp:
                 runtime = self._ensure_cloud_runtime()
                 running = runtime.is_remote_process_running(task["pid_file"])
                 exit_code = runtime.read_exit_code(task["status_file"])
+                payload = self._read_remote_progress_payload(runtime, task.get("progress_file", ""))
+                if payload:
+                    self.root.after(0, lambda p=payload: self._apply_progress_payload(p))
+                    processed = payload.get("processed", 0)
+                    total = payload.get("total", 0)
+                    percent = payload.get("percent", 0)
+                    account = payload.get("current_account", "")
+                    self.log_queue.put(
+                        f"[Cloud] Progress: {processed}/{total} ({percent}%) {account}\n"
+                    )
                 tail_text = self._tail_remote_log(runtime, task["log_file"])
                 if tail_text.strip():
                     self.log_queue.put(f"[Cloud] Хвост удаленного лога:\n{tail_text}\n")
@@ -1488,6 +1640,9 @@ class MailerApp:
             messagebox.showerror("Лог-файл", f"Не удалось открыть лог-файл: {error}")
             return
         self._append_log(f"Лог-файл: {log_file_path}\n")
+        progress_file_path = log_file_path.with_suffix(".progress.json")
+        cmd.extend(["--progress-file", str(progress_file_path)])
+        self._append_log(f"Файл прогресса: {progress_file_path}\n")
         if guessed_template is not None:
             self._append_log(f"Автоподбор шаблона для запуска: {guessed_template}\n")
         self._append_log("Команда:\n")
@@ -1505,6 +1660,9 @@ class MailerApp:
                     remote_cmd = self._build_remote_command(cmd, runtime.get_remote_base_dir())
                     self.log_queue.put("[Cloud] Запуск задачи на сервере (detached)...\n")
                     task = runtime.start_remote_process_detached(remote_cmd)
+                    progress_file = self._extract_flag_value(remote_cmd, "--progress-file")
+                    if progress_file:
+                        task["progress_file"] = progress_file
                     self.remote_run_id = task["run_id"]
                     self.remote_task_meta = task
                     self._persist_cloud_last_task()
@@ -1516,6 +1674,9 @@ class MailerApp:
                         chunk, log_offset = runtime.read_log_chunk(task["log_file"], log_offset)
                         if chunk:
                             self.log_queue.put(chunk)
+                        payload = self._read_remote_progress_payload(runtime, task.get("progress_file", ""))
+                        if payload:
+                            self.root.after(0, lambda p=payload: self._apply_progress_payload(p))
                         running = runtime.is_remote_process_running(task["pid_file"])
                         if not running:
                             chunk, log_offset = runtime.read_log_chunk(task["log_file"], log_offset)
@@ -1597,6 +1758,9 @@ class MailerApp:
             "smtp_port": self.smtp_port_var.get().strip(),
             "smtp_user": self.smtp_user_var.get().strip(),
             "smtp_password": self.smtp_pass_var.get().strip() if self.remember_password_var.get() else "",
+            "smtp_accounts": self.smtp_accounts if self.remember_password_var.get() else [
+                {**item, "password": ""} for item in self.smtp_accounts
+            ],
             "remember_password": self.remember_password_var.get(),
             "from_email": self.from_email_var.get().strip(),
             "limit_min": self.limit_min_var.get().strip(),
@@ -1645,6 +1809,8 @@ class MailerApp:
                 self.smtp_pass_var.set(data.get("smtp_password", ""))
             elif not self.smtp_pass_var.get().strip():
                 self.smtp_pass_var.set(os.getenv("SMTP_PASSWORD", ""))
+            raw_accounts = data.get("smtp_accounts", [])
+            self.smtp_accounts = raw_accounts if isinstance(raw_accounts, list) else []
             self.from_email_var.set(data.get("from_email", self.smtp_user_var.get()))
             self.limit_min_var.set(data.get("limit_min", "20"))
             self.limit_day_var.set(data.get("limit_day", "300"))
