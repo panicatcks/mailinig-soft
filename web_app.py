@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -125,6 +126,88 @@ def merge_secrets(settings: dict) -> dict:
         if not str(merged.get(key, "")).strip():
             merged[key] = stored.get(key, "")
     return merged
+
+
+# --------------------------------------------------------------------------- #
+# Сессии (профили) — совместимы с классическим интерфейсом
+# --------------------------------------------------------------------------- #
+PROFILES_PATH = BASE_DIR / "mailer_profiles.json"
+PROFILE_STATE_DIR = BASE_DIR / "state_profiles"
+
+
+def sanitize_filename_part(text: str) -> str:
+    value = re.sub(r"[^\w\-\.]+", "_", str(text).strip(), flags=re.UNICODE).strip("._")
+    return value[:80] if value else "session"
+
+
+def profile_state_path(name: str) -> Path:
+    safe = sanitize_filename_part(name).lower() or "profile"
+    PROFILE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return PROFILE_STATE_DIR / f"{safe}.json"
+
+
+def read_profiles_store() -> dict:
+    if not PROFILES_PATH.exists():
+        return {"active": "", "profiles": {}}
+    try:
+        data = json.loads(PROFILES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"active": "", "profiles": {}}
+    if not isinstance(data, dict):
+        return {"active": "", "profiles": {}}
+    profiles = data.get("profiles", {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+    return {"active": str(data.get("active", "")), "profiles": profiles}
+
+
+def write_profiles_store(store: dict) -> None:
+    PROFILES_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def list_profiles() -> dict:
+    store = read_profiles_store()
+    return {"active": store.get("active", ""), "names": sorted(store.get("profiles", {}).keys())}
+
+
+def save_profile(name: str, incoming: dict) -> dict:
+    name = str(name).strip()
+    if not name:
+        raise ValueError("Укажите название сессии.")
+    store = read_profiles_store()
+    profiles = store.setdefault("profiles", {})
+    merged = merge_secrets(incoming)
+    existing = profiles.get(name) if isinstance(profiles.get(name), dict) else {}
+    state_file = str(existing.get("state_file", "")).strip() or str(profile_state_path(name))
+    merged["state_file"] = state_file
+    profiles[name] = merged
+    store["active"] = name
+    write_profiles_store(store)
+    save_config(merged)  # активная сессия становится текущим конфигом
+    return list_profiles()
+
+
+def load_profile(name: str) -> dict:
+    store = read_profiles_store()
+    data = store.get("profiles", {}).get(name)
+    if not isinstance(data, dict):
+        raise ValueError("Сессия не найдена.")
+    if not str(data.get("state_file", "")).strip():
+        data["state_file"] = str(profile_state_path(name))
+    store["active"] = name
+    write_profiles_store(store)
+    save_config(data)
+    return public_config(load_config())
+
+
+def delete_profile(name: str) -> dict:
+    store = read_profiles_store()
+    profiles = store.get("profiles", {})
+    profiles.pop(name, None)
+    if store.get("active", "") == name:
+        store["active"] = ""
+    write_profiles_store(store)
+    return list_profiles()
 
 
 # --------------------------------------------------------------------------- #
@@ -473,6 +556,72 @@ def detect_email_columns(to_file: str) -> list[str]:
     return send_email.detect_xlsx_email_columns(Path(to_file).expanduser().resolve(), "ALL")
 
 
+def analyze_workbook(to_file: str) -> dict:
+    """Умный разбор: сам находит колонку email, строку начала данных,
+    считает получателей и разбирается с несколькими вкладками."""
+    import send_email
+    path = Path(to_file).expanduser().resolve()
+    if not path.exists():
+        return {"ok": False, "message": "Файл не найден."}
+
+    ext = path.suffix.lower()
+    if ext in {".csv", ".txt"}:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        emails = {m.lower() for m in send_email.EMAIL_RE.findall(content)}
+        if not emails:
+            return {"ok": False, "message": "В файле не нашлось ни одного email."}
+        return {"ok": True, "email_col": "A", "start_row": 1, "total": len(emails),
+                "sheets": 1, "columns": ["A"],
+                "message": f"Найдено {len(emails)} адресов в текстовом файле."}
+
+    if ext != ".xlsx":
+        return {"ok": False, "message": "Поддерживаются .xlsx, .csv, .txt."}
+
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return {"ok": False, "message": "Не установлен openpyxl."}
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        col_hits: dict[int, int] = {}              # сколько email в каждой колонке (по всем листам)
+        col_first_row: dict[int, int] = {}         # первая строка с email в колонке
+        unique_emails: dict[int, set] = {}         # уникальные адреса по колонке
+        sheet_count = 0
+        for sheet in wb.worksheets:
+            sheet_count += 1
+            for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=5000, values_only=True), start=1):
+                for col_idx, value in enumerate(row, start=1):
+                    text = send_email.to_str(value)
+                    if text and send_email.EMAIL_RE.fullmatch(text):
+                        col_hits[col_idx] = col_hits.get(col_idx, 0) + 1
+                        if col_idx not in col_first_row:
+                            col_first_row[col_idx] = row_idx
+                        unique_emails.setdefault(col_idx, set()).add(text.lower())
+        if not col_hits:
+            return {"ok": False, "message": "Не нашёл ни одного email ни на одной вкладке. "
+                                            "Проверь, что в файле есть адреса."}
+        # Лучшая колонка — где больше всего адресов
+        best_col = max(col_hits.items(), key=lambda kv: kv[1])[0]
+        best_letter = get_column_letter(best_col)
+        start_row = col_first_row.get(best_col, 1)
+        total = len(unique_emails.get(best_col, set()))
+        ranked = [get_column_letter(c) for c, _ in sorted(col_hits.items(), key=lambda kv: kv[1], reverse=True)[:5]]
+        sheets_note = f", вкладок: {sheet_count} (объединяю все)" if sheet_count > 1 else ""
+        return {
+            "ok": True,
+            "email_col": best_letter,
+            "start_row": start_row,
+            "total": total,
+            "sheets": sheet_count,
+            "columns": ranked,
+            "message": f"Нашёл {total} получателей · колонка {best_letter} · с {start_row}-й строки{sheets_note}.",
+        }
+    finally:
+        wb.close()
+
+
 def hub_check(settings: dict) -> dict:
     url = _s(settings, "hub_url")
     if not url:
@@ -580,6 +729,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(WEB_DIR / "styles.css", "text/css; charset=utf-8")
         elif route == "/api/config":
             self._send_json(public_config(load_config()))
+        elif route == "/api/profiles":
+            self._send_json(list_profiles())
         elif route == "/api/progress":
             self._send_json(MANAGER.progress())
         else:
@@ -598,6 +749,14 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/detect-column":
                 cols = detect_email_columns(body.get("to_file", ""))
                 self._send_json({"ok": bool(cols), "columns": cols})
+            elif route == "/api/analyze":
+                self._send_json(analyze_workbook(body.get("to_file", "")))
+            elif route == "/api/profiles/save":
+                self._send_json({"ok": True, **save_profile(body.get("name", ""), body.get("settings", {}))})
+            elif route == "/api/profiles/load":
+                self._send_json({"ok": True, "settings": load_profile(body.get("name", ""))})
+            elif route == "/api/profiles/delete":
+                self._send_json({"ok": True, **delete_profile(body.get("name", ""))})
             elif route == "/api/count":
                 self._send_json(count_recipients(body.get("settings", {})))
             elif route == "/api/hub-check":

@@ -35,6 +35,7 @@ const CHECKBOXES = new Set([
 ]);
 
 let pollTimer = null;
+let activeStateFile = ".send_email_state.json";
 const $ = (id) => document.getElementById(id);
 
 async function api(path, body) {
@@ -59,7 +60,7 @@ function collectSettings() {
     s[key] = CHECKBOXES.has(id) ? el.checked : el.value.trim();
   }
   s.sheet = "ALL";              // веб-режим всегда объединяет вкладки
-  s.state_file = ".send_email_state.json";
+  s.state_file = activeStateFile;
   return s;
 }
 
@@ -73,6 +74,7 @@ function applyConfig(cfg) {
   $("passNote").textContent = cfg.has_smtp_password ? "(сохранён, оставь пустым)" : "";
   $("hubNote").textContent = cfg.has_hub_secret ? "(сохранён)" : "";
   $("srvNote").textContent = cfg.has_server_password ? "(сохранён)" : "";
+  activeStateFile = (cfg.state_file && cfg.state_file.trim()) || ".send_email_state.json";
   refreshCloudPill();
 }
 
@@ -96,25 +98,74 @@ async function browse(kind) {
   if (kind === "excel") {
     $("toFile").value = r.path;
     scheduleSave();
-    detectColumn(true);
+    smartAnalyze(true);
   } else {
     $("template").value = r.path;
     scheduleSave();
   }
 }
 
-async function detectColumn(silent) {
+// Умный разбор: сам находит колонку email, строку начала данных и считает получателей.
+async function smartAnalyze(silent) {
   const file = $("toFile").value.trim();
   if (!file) { if (!silent) toast("Сначала выбери базу", "err"); return; }
-  $("detectHint").textContent = "ищу…";
-  const r = await api("/api/detect-column", { to_file: file });
-  if (r.ok && r.columns.length) {
-    $("emailCol").value = r.columns[0];
-    $("detectHint").textContent = "найдено: " + r.columns.join(", ");
+  $("detectHint").textContent = "🔍 разбираю файл…";
+  $("detectHint").className = "hint detect-hint";
+  const r = await api("/api/analyze", { to_file: file });
+  if (r.ok) {
+    if (r.email_col) $("emailCol").value = r.email_col;
+    if (r.start_row) $("start_row").value = r.start_row;
+    $("detectHint").textContent = "✓ " + r.message;
+    $("detectHint").className = "hint detect-hint ok";
     scheduleSave();
   } else {
-    $("detectHint").textContent = silent ? "" : "колонку не нашёл — впиши вручную";
+    $("detectHint").textContent = "✗ " + (r.message || "не получилось разобрать файл");
+    $("detectHint").className = "hint detect-hint err";
   }
+}
+
+// --- сессии (профили) ---
+async function loadProfiles() {
+  const r = await api("/api/profiles");
+  const sel = $("profileSelect");
+  const current = r.active || "";
+  sel.innerHTML = '<option value="">— без сессии —</option>' +
+    (r.names || []).map((n) => `<option value="${n.replace(/"/g, "&quot;")}">${n}</option>`).join("");
+  sel.value = current;
+}
+
+async function profileLoad() {
+  const name = $("profileSelect").value;
+  if (!name) return toast("Выбери сессию из списка", "err");
+  const r = await api("/api/profiles/load", { name });
+  if (r.ok) { applyConfig(r.settings); await loadProfiles(); toast("Сессия загружена: " + name, "ok"); }
+  else toast(r.message || "Не удалось загрузить", "err");
+}
+
+async function profileSaveTo(name) {
+  const r = await api("/api/profiles/save", { name, settings: collectSettings() });
+  if (r.ok) { await loadProfiles(); $("profileSelect").value = r.active || name; toast("Сессия сохранена: " + name, "ok"); applyConfig(await api("/api/config")); }
+  else toast(r.message || "Не удалось сохранить", "err");
+}
+
+function profileSave() {
+  const name = $("profileSelect").value;
+  if (!name) return profileNew();
+  profileSaveTo(name);
+}
+
+function profileNew() {
+  const name = (window.prompt("Название новой сессии:") || "").trim();
+  if (!name) return;
+  profileSaveTo(name);
+}
+
+async function profileDelete() {
+  const name = $("profileSelect").value;
+  if (!name) return toast("Выбери сессию", "err");
+  if (!window.confirm(`Удалить сессию «${name}»?`)) return;
+  const r = await api("/api/profiles/delete", { name });
+  if (r.ok) { await loadProfiles(); toast("Сессия удалена", ""); }
 }
 
 async function check() {
@@ -225,7 +276,11 @@ async function init() {
 
   document.querySelectorAll("[data-browse]").forEach((b) =>
     b.addEventListener("click", () => browse(b.dataset.browse)));
-  $("detectBtn").addEventListener("click", () => detectColumn(false));
+  $("detectBtn").addEventListener("click", () => smartAnalyze(false));
+  $("profileLoad").addEventListener("click", profileLoad);
+  $("profileSave").addEventListener("click", profileSave);
+  $("profileNew").addEventListener("click", profileNew);
+  $("profileDelete").addEventListener("click", profileDelete);
   $("checkBtn").addEventListener("click", check);
   $("sendBtn").addEventListener("click", () => start(false, null));
   $("stopBtn").addEventListener("click", stop);
@@ -247,6 +302,8 @@ async function init() {
     const el = $(id);
     if (el) el.addEventListener("change", scheduleSave);
   }
+
+  await loadProfiles();
 
   // если на сервере уже что-то выполняется — подхватим
   refreshProgress();

@@ -18,3 +18,5 @@ mailer_gui_config.json
 .update_state.json
 logs/
 *.progress.json
+mailer_profiles.json
+state_profiles/

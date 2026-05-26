@@ -60,6 +60,22 @@ body {
 .card-title { margin: 0 0 4px; font-size: 16px; }
 .card-hint { margin: 0 0 18px; color: var(--muted); font-size: 13px; }
 
+/* Session bar */
+.session-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border);
+}
+.session-label { font-size: 13px; font-weight: 600; color: var(--muted); }
+#profileSelect {
+  flex: 1; min-width: 150px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 9px; padding: 9px 10px; font-size: 14px;
+}
+.btn-sm { padding: 8px 12px; font-size: 13px; }
+
+.detect-hint { margin-top: 8px; display: block; }
+.detect-hint.ok { color: #7ee2a8; }
+.detect-hint.err { color: #ff9a93; }
+
 /* Steps */
 .step { display: flex; gap: 14px; padding: 16px 0; border-top: 1px solid var(--border); }
 .step:first-of-type { border-top: none; padding-top: 4px; }

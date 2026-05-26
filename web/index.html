@@ -25,8 +25,16 @@
     <main class="layout">
       <!-- ЛЕВО: шаги -->
       <section class="card">
+        <div class="session-bar">
+          <span class="session-label">Сессия:</span>
+          <select id="profileSelect"><option value="">— без сессии —</option></select>
+          <button id="profileLoad" class="btn btn-ghost btn-sm">Загрузить</button>
+          <button id="profileSave" class="btn btn-ghost btn-sm">Сохранить</button>
+          <button id="profileNew" class="btn btn-ghost btn-sm">+ Создать</button>
+          <button id="profileDelete" class="btn btn-ghost btn-sm">Удалить</button>
+        </div>
         <h2 class="card-title">Новая рассылка</h2>
-        <p class="card-hint">Выбери базу, укажи колонку с email, выбери письмо — и отправляй.</p>
+        <p class="card-hint">Выбери базу — программа сама разберётся с колонками и вкладками. Затем выбери письмо и отправляй.</p>
 
         <div class="step">
           <div class="step-num">1</div>
@@ -43,12 +51,12 @@
         <div class="step">
           <div class="step-num">2</div>
           <div class="step-body">
-            <label>Колонка с email</label>
+            <label>Колонка с email <span class="hint">(определяется сама)</span></label>
             <div class="row">
               <input id="emailCol" type="text" class="narrow" placeholder="G" />
-              <button id="detectBtn" class="btn btn-ghost">Определить автоматически</button>
-              <span id="detectHint" class="hint"></span>
+              <button id="detectBtn" class="btn btn-ghost">🔍 Разобраться автоматически</button>
             </div>
+            <div id="detectHint" class="hint detect-hint"></div>
           </div>
         </div>
 
