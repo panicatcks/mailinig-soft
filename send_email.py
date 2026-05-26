@@ -497,6 +497,13 @@ def select_sheet(workbook, sheet_arg: str):
     return workbook[sheet_arg]
 
 
+def select_sheets(workbook, sheet_arg: str) -> list:
+    """Вернуть список листов для чтения. 'ALL' — все листы книги."""
+    if (sheet_arg or "").strip().upper() == "ALL":
+        return list(workbook.worksheets)
+    return [select_sheet(workbook, sheet_arg)]
+
+
 def load_recipients_from_file(
     path: Path,
     xlsx_sheet: str,
@@ -525,43 +532,45 @@ def load_recipients_from_file(
 
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        sheet = select_sheet(wb, xlsx_sheet)
+        sheets = select_sheets(wb, xlsx_sheet)
         email_idx = col_to_index(xlsx_email_col)
         field_indexes = {col: col_to_index(col) for col in xlsx_fields}
         kind_idx = col_to_index(xlsx_kind_col) if xlsx_kind_col else None
 
         recipients: list[RecipientRow] = []
         seen = set()
-        for row_idx, row in enumerate(
-            sheet.iter_rows(min_row=xlsx_start_row, values_only=True), start=xlsx_start_row
-        ):
-            email_cell = row[email_idx - 1] if len(row) >= email_idx else None
-            emails = extract_emails(to_str(email_cell))
-            if not emails:
-                continue
-
-            fields: dict[str, str] = {}
-            for col, idx in field_indexes.items():
-                value = row[idx - 1] if len(row) >= idx else None
-                fields[col] = to_str(value)
-                fields[f"COL_{col}"] = to_str(value)
-            if kind_idx:
-                kind_value = to_str(row[kind_idx - 1] if len(row) >= kind_idx else None)
-                if xlsx_kind_filter is not None and kind_value.lower() not in xlsx_kind_filter:
+        for sheet in sheets:
+            for row_idx, row in enumerate(
+                sheet.iter_rows(min_row=xlsx_start_row, values_only=True), start=xlsx_start_row
+            ):
+                email_cell = row[email_idx - 1] if len(row) >= email_idx else None
+                emails = extract_emails(to_str(email_cell))
+                if not emails:
                     continue
-                fields["KIND"] = kind_value
-                if xlsx_kind_col:
-                    fields[xlsx_kind_col] = kind_value
-                    fields[f"COL_{xlsx_kind_col}"] = kind_value
-            fields["ROW"] = str(row_idx)
 
-            for email in emails:
-                if not allow_duplicate_emails:
-                    key = email.lower()
-                    if key in seen:
+                fields: dict[str, str] = {}
+                for col, idx in field_indexes.items():
+                    value = row[idx - 1] if len(row) >= idx else None
+                    fields[col] = to_str(value)
+                    fields[f"COL_{col}"] = to_str(value)
+                if kind_idx:
+                    kind_value = to_str(row[kind_idx - 1] if len(row) >= kind_idx else None)
+                    if xlsx_kind_filter is not None and kind_value.lower() not in xlsx_kind_filter:
                         continue
-                    seen.add(key)
-                recipients.append(RecipientRow(email=email, fields=dict(fields), source_row=row_idx))
+                    fields["KIND"] = kind_value
+                    if xlsx_kind_col:
+                        fields[xlsx_kind_col] = kind_value
+                        fields[f"COL_{xlsx_kind_col}"] = kind_value
+                fields["ROW"] = str(row_idx)
+                fields["SHEET"] = to_str(getattr(sheet, "title", ""))
+
+                for email in emails:
+                    if not allow_duplicate_emails:
+                        key = email.lower()
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    recipients.append(RecipientRow(email=email, fields=dict(fields), source_row=row_idx))
         return recipients
     finally:
         wb.close()
@@ -576,13 +585,14 @@ def detect_xlsx_email_columns(path: Path, xlsx_sheet: str, sample_rows: int = 20
 
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        sheet = select_sheet(wb, xlsx_sheet)
+        sheets = select_sheets(wb, xlsx_sheet)
         hits: dict[int, int] = {}
-        for row in sheet.iter_rows(min_row=1, max_row=sample_rows, values_only=True):
-            for col_idx, value in enumerate(row, start=1):
-                text = to_str(value)
-                if text and EMAIL_RE.fullmatch(text):
-                    hits[col_idx] = hits.get(col_idx, 0) + 1
+        for sheet in sheets:
+            for row in sheet.iter_rows(min_row=1, max_row=sample_rows, values_only=True):
+                for col_idx, value in enumerate(row, start=1):
+                    text = to_str(value)
+                    if text and EMAIL_RE.fullmatch(text):
+                        hits[col_idx] = hits.get(col_idx, 0) + 1
         sorted_hits = sorted(hits.items(), key=lambda item: item[1], reverse=True)
         return [get_column_letter(col_idx) for col_idx, _ in sorted_hits[:5]]
     finally:

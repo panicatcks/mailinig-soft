@@ -281,6 +281,7 @@ class MailerApp:
     def _on_dirty_trigger(self, *_args) -> None:
         if not self._suspend_dirty_tracking:
             self._set_settings_dirty(True)
+        self._refresh_simple_pixel_status()
 
     def _bind_state_traces(self) -> None:
         refresh_vars = [
@@ -578,6 +579,7 @@ class MailerApp:
         notebook = ttk.Notebook(parent)
         notebook.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
 
+        simple_tab = ttk.Frame(notebook, padding=10)
         send_tab = ttk.Frame(notebook, padding=10)
         test_tab = ttk.Frame(notebook, padding=10)
         hub_tab = ttk.Frame(notebook, padding=10)
@@ -585,17 +587,152 @@ class MailerApp:
         log_tab = ttk.Frame(notebook, padding=10)
         log_tab.columnconfigure(0, weight=1)
         log_tab.rowconfigure(0, weight=1)
+        notebook.add(simple_tab, text="Просто")
         notebook.add(send_tab, text="Рассылка")
         notebook.add(test_tab, text="Тест")
         notebook.add(hub_tab, text="Хаб")
         notebook.add(cloud_tab, text="Облако")
         notebook.add(log_tab, text="Логи")
 
+        self._build_simple_controls(simple_tab)
         self._build_send_controls(send_tab)
         self._build_test_controls(test_tab)
         self._build_hub_controls(hub_tab)
         self._build_cloud_controls(cloud_tab)
         self._build_log_section(log_tab)
+
+    def _build_simple_controls(self, frame: ttk.Frame) -> None:
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Простой режим: выбери Excel, укажи колонку email, выбери HTML — и отправляй.",
+            style="Header.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(frame, text="1. Excel-база:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(frame, textvariable=self.to_file_var).grid(row=1, column=1, sticky="ew")
+        ttk.Button(frame, text="Выбрать Excel", command=self._pick_excel).grid(
+            row=1, column=2, padx=(8, 0)
+        )
+        ttk.Label(
+            frame,
+            text="Все вкладки книги объединяются автоматически, дубликаты email убираются.",
+        ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 8))
+
+        ttk.Label(frame, text="2. Колонка email:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(frame, textvariable=self.email_col_var, width=10).grid(
+            row=3, column=1, sticky="w"
+        )
+        ttk.Button(frame, text="Определить", command=self._simple_detect_email_col).grid(
+            row=3, column=2, padx=(8, 0)
+        )
+        ttk.Label(
+            frame,
+            text="Буква колонки с адресами (например G).",
+        ).grid(row=4, column=1, columnspan=2, sticky="w", pady=(2, 8))
+
+        ttk.Label(frame, text="3. HTML-письмо:").grid(row=5, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(frame, textvariable=self.template_var).grid(row=5, column=1, sticky="ew")
+        ttk.Button(frame, text="Выбрать HTML", command=self._simple_pick_template).grid(
+            row=5, column=2, padx=(8, 0)
+        )
+
+        ttk.Label(frame, text="Тема (опц.):").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.subject_var).grid(
+            row=6, column=1, columnspan=2, sticky="ew", pady=(8, 0)
+        )
+
+        actions = ttk.Frame(frame)
+        actions.grid(row=7, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Button(actions, text="Проверить", command=self._simple_dry_run).grid(row=0, column=0)
+        ttk.Button(actions, text="📨 Отправить", command=self._simple_send).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(actions, text="Стоп", command=self._stop_process).grid(row=0, column=2, padx=(8, 0))
+
+        self.simple_pixel_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.simple_pixel_var).grid(
+            row=8, column=0, columnspan=3, sticky="w", pady=(10, 0)
+        )
+        self._refresh_simple_pixel_status()
+
+    def _apply_simple_mode_settings(self) -> None:
+        """Зафиксировать простые значения по умолчанию перед запуском."""
+        self.sheet_var.set("ALL")
+        self.kind_filter_var.set("ALL")
+        self.use_kind_template_var.set(False)
+        self.auto_template_var.set(False)
+        if not self.start_row_var.get().strip():
+            self.start_row_var.set("2")
+
+    def _refresh_simple_pixel_status(self) -> None:
+        if not hasattr(self, "simple_pixel_var"):
+            return
+        hub_url = self.hub_url_var.get().strip()
+        cid = self.hub_connection_id_var.get().strip()
+        secret = self.hub_secret_var.get().strip()
+        if hub_url and cid and secret:
+            self.simple_pixel_var.set("Пиксель открытий: включён (настройки на вкладке «Хаб»).")
+        else:
+            self.simple_pixel_var.set("Пиксель открытий: выключен. Заполни вкладку «Хаб» один раз.")
+
+    def _simple_detect_email_col(self) -> None:
+        to_file = self.to_file_var.get().strip()
+        if not to_file:
+            messagebox.showinfo("Колонка email", "Сначала выбери Excel-базу.")
+            return
+        try:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("send_email_detect", str(SCRIPT_PATH))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            suggestions = module.detect_xlsx_email_columns(
+                Path(to_file).expanduser().resolve(), "ALL"
+            )
+        except Exception as error:
+            messagebox.showerror("Колонка email", f"Не удалось прочитать файл: {error}")
+            return
+        if not suggestions:
+            messagebox.showwarning("Колонка email", "Не нашёл колонку с email. Укажи букву вручную.")
+            return
+        self.email_col_var.set(suggestions[0])
+        self._append_log(f"\nАвтоопределение колонки email: {', '.join(suggestions)} → {suggestions[0]}\n")
+
+    def _simple_pick_template(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Выберите HTML письмо",
+            filetypes=[("HTML", "*.html *.htm"), ("Все файлы", "*.*")],
+        )
+        if path:
+            self.template_var.set(path)
+            self.auto_template_var.set(False)
+            self._refresh_state_info()
+
+    def _simple_dry_run(self) -> None:
+        if not self._simple_validate():
+            return
+        self._apply_simple_mode_settings()
+        self._start_process(force_dry_run=True)
+
+    def _simple_send(self) -> None:
+        if not self._simple_validate():
+            return
+        self._apply_simple_mode_settings()
+        self._start_process(force_dry_run=False)
+
+    def _simple_validate(self) -> bool:
+        if not self.to_file_var.get().strip():
+            messagebox.showerror("Проверка", "Шаг 1: выбери Excel-базу.")
+            return False
+        if not self.email_col_var.get().strip():
+            messagebox.showerror("Проверка", "Шаг 2: укажи колонку email (например G).")
+            return False
+        if not self.template_var.get().strip():
+            messagebox.showerror("Проверка", "Шаг 3: выбери HTML письмо.")
+            return False
+        return True
 
     def _build_send_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(0, weight=1)
