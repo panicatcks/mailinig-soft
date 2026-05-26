@@ -16,3 +16,5 @@ mailer_gui_config.json
 *.txt
 !requirements.txt
 .update_state.json
+logs/
+*.progress.json

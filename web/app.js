@@ -1,0 +1,255 @@
+"use strict";
+
+// id поля в DOM -> ключ в конфиге
+const FIELDS = {
+  toFile: "to_file",
+  emailCol: "email_col",
+  template: "template",
+  subject: "subject",
+  smtp_host: "smtp_host",
+  smtp_port: "smtp_port",
+  smtp_user: "smtp_user",
+  smtp_password: "smtp_password",
+  from_email: "from_email",
+  limit_min: "limit_min",
+  limit_day: "limit_day",
+  start_row: "start_row",
+  allow_duplicate_emails: "allow_duplicate_emails",
+  use_kind_template: "use_kind_template",
+  kind_col: "kind_col",
+  kind_filter: "kind_filter",
+  hub_url: "hub_url",
+  hub_connection_id: "hub_connection_id",
+  hub_secret: "hub_secret",
+  hub_insecure_ssl: "hub_insecure_ssl",
+  cloud_enabled: "cloud_enabled",
+  server_host: "server_host",
+  server_port: "server_port",
+  server_user: "server_user",
+  server_password: "server_password",
+  server_remote_dir: "server_remote_dir",
+  test_email: "test_email",
+};
+const CHECKBOXES = new Set([
+  "allow_duplicate_emails", "use_kind_template", "hub_insecure_ssl", "cloud_enabled",
+]);
+
+let pollTimer = null;
+const $ = (id) => document.getElementById(id);
+
+async function api(path, body) {
+  const opts = { method: body ? "POST" : "GET" };
+  if (body) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify(body); }
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+function toast(msg, kind = "") {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show " + kind;
+  setTimeout(() => { el.className = "toast " + kind; }, 3200);
+}
+
+function collectSettings() {
+  const s = {};
+  for (const [id, key] of Object.entries(FIELDS)) {
+    const el = $(id);
+    if (!el) continue;
+    s[key] = CHECKBOXES.has(id) ? el.checked : el.value.trim();
+  }
+  s.sheet = "ALL";              // веб-режим всегда объединяет вкладки
+  s.state_file = ".send_email_state.json";
+  return s;
+}
+
+function applyConfig(cfg) {
+  for (const [id, key] of Object.entries(FIELDS)) {
+    const el = $(id);
+    if (!el) continue;
+    if (CHECKBOXES.has(id)) el.checked = !!cfg[key];
+    else el.value = cfg[key] != null ? cfg[key] : "";
+  }
+  $("passNote").textContent = cfg.has_smtp_password ? "(сохранён, оставь пустым)" : "";
+  $("hubNote").textContent = cfg.has_hub_secret ? "(сохранён)" : "";
+  $("srvNote").textContent = cfg.has_server_password ? "(сохранён)" : "";
+  refreshCloudPill();
+}
+
+function refreshCloudPill() {
+  const on = $("cloud_enabled").checked;
+  const pill = $("cloudPill");
+  pill.textContent = on ? "Облако: вкл" : "Облако: выкл";
+  pill.className = "pill " + (on ? "pill-on" : "pill-muted");
+}
+
+let saveTimer = null;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => api("/api/config", { settings: collectSettings() }), 600);
+}
+
+// --- действия ---
+async function browse(kind) {
+  const r = await api("/api/browse", { kind });
+  if (!r.ok || !r.path) return;
+  if (kind === "excel") {
+    $("toFile").value = r.path;
+    scheduleSave();
+    detectColumn(true);
+  } else {
+    $("template").value = r.path;
+    scheduleSave();
+  }
+}
+
+async function detectColumn(silent) {
+  const file = $("toFile").value.trim();
+  if (!file) { if (!silent) toast("Сначала выбери базу", "err"); return; }
+  $("detectHint").textContent = "ищу…";
+  const r = await api("/api/detect-column", { to_file: file });
+  if (r.ok && r.columns.length) {
+    $("emailCol").value = r.columns[0];
+    $("detectHint").textContent = "найдено: " + r.columns.join(", ");
+    scheduleSave();
+  } else {
+    $("detectHint").textContent = silent ? "" : "колонку не нашёл — впиши вручную";
+  }
+}
+
+async function check() {
+  setReadout("Проверяю базу и шаблон…", "");
+  const r = await api("/api/count", { settings: collectSettings() });
+  if (r.ok) {
+    setReadout(`✓ Готово к отправке. Получателей: ${r.total != null ? r.total : "?"}`, "ok");
+  } else {
+    setReadout("✗ " + (r.message || "Ошибка проверки"), "err");
+  }
+}
+
+function setReadout(text, kind) {
+  const el = $("readout");
+  el.textContent = text;
+  el.className = "readout " + kind;
+}
+
+async function start(dryRun, overrideTo) {
+  const settings = collectSettings();
+  if (!settings.to_file && !overrideTo) return toast("Шаг 1: выбери базу", "err");
+  if (!settings.email_col && !overrideTo) return toast("Шаг 2: укажи колонку email", "err");
+  if (!settings.template) return toast("Шаг 3: выбери HTML-письмо", "err");
+
+  const body = { settings, dry_run: dryRun };
+  if (overrideTo) body.override_to = overrideTo;
+  const r = await api("/api/start", body);
+  if (!r.ok) { toast(r.message || "Не удалось запустить", "err"); return; }
+  toast(r.execution === "cloud" ? "Запущено в облаке" : "Запущено локально", "ok");
+  setSending(true);
+  startPolling();
+}
+
+async function stop() {
+  const r = await api("/api/stop", {});
+  toast(r.message || "Остановлено");
+}
+
+function setSending(on) {
+  $("sendBtn").disabled = on;
+  $("checkBtn").disabled = on;
+  $("testBtn").disabled = on;
+  $("stopBtn").disabled = !on;
+}
+
+// --- прогресс ---
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(refreshProgress, 1000);
+  refreshProgress();
+}
+
+async function refreshProgress() {
+  const p = await api("/api/progress");
+  const prog = p.progress || {};
+  const total = prog.total || 0;
+  const sent = prog.sent || 0;
+  const failed = prog.failed || 0;
+  const skipped = prog.skipped || 0;
+  const processed = prog.processed != null ? prog.processed : (sent + failed + skipped);
+  const percent = prog.percent != null ? prog.percent : (total ? Math.round(processed / total * 100) : 0);
+
+  $("statSent").textContent = sent;
+  $("statTotal").textContent = total;
+  $("statFailed").textContent = failed;
+  $("statSkipped").textContent = skipped;
+  $("barFill").style.width = Math.min(percent, 100) + "%";
+  $("percentText").textContent = Math.min(percent, 100) + "%";
+
+  const status = $("statusLine");
+  if (p.running) {
+    status.textContent = (p.execution === "cloud" ? "Облако · " : "") +
+      (p.dry_run ? "Проверка…" : "Отправка идёт…") + (p.started_at ? " (с " + p.started_at + ")" : "");
+    status.className = "status-line run";
+  } else if (p.finished) {
+    const msg = prog.message || (prog.status === "completed" ? "Готово" : "Завершено");
+    const failedRun = prog.status && prog.status !== "completed";
+    status.textContent = (p.dry_run ? "Проверка завершена. " : "") + msg;
+    status.className = "status-line " + (failedRun ? "fail" : "done");
+  }
+  if (p.log != null) {
+    const log = $("log");
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.textContent = p.log;
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  if (!p.running && (p.finished || !p.progress)) {
+    if (pollTimer && p.finished) { clearInterval(pollTimer); pollTimer = null; setSending(false); }
+  }
+}
+
+async function hubCheck() {
+  $("hubStatus").textContent = "проверяю…";
+  const r = await api("/api/hub-check", { settings: collectSettings() });
+  $("hubStatus").textContent = (r.ok ? "✓ " : "✗ ") + r.message;
+}
+
+async function cloudCheck() {
+  $("cloudStatus").textContent = "подключаюсь…";
+  const r = await api("/api/cloud-check", { settings: collectSettings() });
+  $("cloudStatus").textContent = (r.ok ? "✓ " : "✗ ") + r.message;
+}
+
+// --- инициализация ---
+async function init() {
+  applyConfig(await api("/api/config"));
+
+  document.querySelectorAll("[data-browse]").forEach((b) =>
+    b.addEventListener("click", () => browse(b.dataset.browse)));
+  $("detectBtn").addEventListener("click", () => detectColumn(false));
+  $("checkBtn").addEventListener("click", check);
+  $("sendBtn").addEventListener("click", () => start(false, null));
+  $("stopBtn").addEventListener("click", stop);
+  $("testBtn").addEventListener("click", () => {
+    const email = $("test_email").value.trim();
+    if (!email) return toast("Укажи email для теста", "err");
+    start(false, [email]);
+  });
+  $("hubCheckBtn").addEventListener("click", hubCheck);
+  $("cloudCheckBtn").addEventListener("click", cloudCheck);
+  $("cloud_enabled").addEventListener("change", refreshCloudPill);
+  $("settingsBtn").addEventListener("click", () => {
+    document.querySelector(".advanced").open = true;
+    document.querySelector(".advanced").scrollIntoView({ behavior: "smooth" });
+  });
+
+  // автосохранение при изменениях
+  for (const id of Object.keys(FIELDS)) {
+    const el = $(id);
+    if (el) el.addEventListener("change", scheduleSave);
+  }
+
+  // если на сервере уже что-то выполняется — подхватим
+  refreshProgress();
+}
+
+init();

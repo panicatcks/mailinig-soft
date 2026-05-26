@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SMTP Рассылка</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">✉</div>
+        <div>
+          <div class="brand-title">SMTP Рассылка</div>
+          <div class="brand-sub">ПРОМТЕХРЕШЕНИЯ · веб-версия</div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <span id="cloudPill" class="pill pill-muted">Облако: выкл</span>
+        <button id="settingsBtn" class="btn btn-ghost">⚙ Настройки</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- ЛЕВО: шаги -->
+      <section class="card">
+        <h2 class="card-title">Новая рассылка</h2>
+        <p class="card-hint">Выбери базу, укажи колонку с email, выбери письмо — и отправляй.</p>
+
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <label>База получателей (Excel/CSV)</label>
+            <div class="row">
+              <input id="toFile" type="text" placeholder="Файл не выбран" readonly />
+              <button class="btn" data-browse="excel">Выбрать</button>
+            </div>
+            <div class="muted">Все вкладки книги объединяются автоматически, дубли email убираются.</div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <label>Колонка с email</label>
+            <div class="row">
+              <input id="emailCol" type="text" class="narrow" placeholder="G" />
+              <button id="detectBtn" class="btn btn-ghost">Определить автоматически</button>
+              <span id="detectHint" class="hint"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <label>HTML-письмо</label>
+            <div class="row">
+              <input id="template" type="text" placeholder="Файл не выбран" readonly />
+              <button class="btn" data-browse="html">Выбрать</button>
+            </div>
+            <label class="mt">Тема письма</label>
+            <input id="subject" type="text" placeholder="Например: Коммерческое предложение" />
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="checkBtn" class="btn btn-ghost">Проверить</button>
+          <button id="sendBtn" class="btn btn-primary">📨 Отправить</button>
+          <button id="stopBtn" class="btn btn-danger" disabled>Стоп</button>
+        </div>
+        <div id="readout" class="readout"></div>
+
+        <!-- РАСШИРЕННЫЕ -->
+        <details class="advanced">
+          <summary>⚙ Расширенные настройки</summary>
+
+          <div class="adv-group">
+            <h3>Отправитель (SMTP)</h3>
+            <div class="grid2">
+              <div><label>SMTP-сервер</label><input id="smtp_host" /></div>
+              <div><label>Порт</label><input id="smtp_port" class="narrow" /></div>
+              <div><label>Логин</label><input id="smtp_user" /></div>
+              <div><label>Пароль <span id="passNote" class="hint"></span></label><input id="smtp_password" type="password" placeholder="••••••" /></div>
+              <div><label>From (адрес отправителя)</label><input id="from_email" /></div>
+            </div>
+          </div>
+
+          <div class="adv-group">
+            <h3>Лимиты и строки</h3>
+            <div class="grid2">
+              <div><label>Писем в минуту</label><input id="limit_min" class="narrow" /></div>
+              <div><label>Писем в сутки</label><input id="limit_day" class="narrow" /></div>
+              <div><label>Начать со строки</label><input id="start_row" class="narrow" /></div>
+              <div class="check"><label><input id="allow_duplicate_emails" type="checkbox" /> Разрешить повторы email</label></div>
+            </div>
+          </div>
+
+          <div class="adv-group">
+            <h3>Разные письма по типу (необязательно)</h3>
+            <div class="check"><label><input id="use_kind_template" type="checkbox" /> Выбирать шаблон по колонке «вид рассылки»</label></div>
+            <div class="grid2">
+              <div><label>Колонка вида</label><input id="kind_col" class="narrow" placeholder="P" /></div>
+              <div><label>Фильтр вида</label><input id="kind_filter" placeholder="ALL" /></div>
+            </div>
+            <div class="muted">Нужно, только если разным получателям шлёшь разные письма. Обычно — выключено.</div>
+          </div>
+
+          <div class="adv-group">
+            <h3>Отслеживание открытий (пиксель / Хаб)</h3>
+            <div class="grid2">
+              <div><label>Hub URL</label><input id="hub_url" /></div>
+              <div><label>Connection ID</label><input id="hub_connection_id" class="narrow" /></div>
+              <div class="col2"><label>Hub Secret <span id="hubNote" class="hint"></span></label><input id="hub_secret" type="password" placeholder="••••••" /></div>
+              <div class="check"><label><input id="hub_insecure_ssl" type="checkbox" /> Игнорировать ошибки SSL</label></div>
+            </div>
+            <button id="hubCheckBtn" class="btn btn-ghost">Проверить пиксель</button>
+            <span id="hubStatus" class="hint"></span>
+          </div>
+
+          <div class="adv-group">
+            <h3>Облачный режим (отправка с сервера)</h3>
+            <div class="check"><label><input id="cloud_enabled" type="checkbox" /> Включить облако (рассылка идёт на сервере, а не с этого мака)</label></div>
+            <div class="grid2">
+              <div><label>Адрес сервера</label><input id="server_host" /></div>
+              <div><label>Порт SSH</label><input id="server_port" class="narrow" /></div>
+              <div><label>Логин</label><input id="server_user" /></div>
+              <div><label>Пароль <span id="srvNote" class="hint"></span></label><input id="server_password" type="password" placeholder="••••••" /></div>
+              <div class="col2"><label>Папка на сервере</label><input id="server_remote_dir" /></div>
+            </div>
+            <button id="cloudCheckBtn" class="btn btn-ghost">Проверить подключение</button>
+            <span id="cloudStatus" class="hint"></span>
+          </div>
+
+          <div class="adv-group">
+            <h3>Тестовое письмо</h3>
+            <div class="row">
+              <input id="test_email" placeholder="you@example.com" />
+              <button id="testBtn" class="btn btn-ghost">Отправить тест</button>
+            </div>
+            <div class="muted">Тест уходит только на этот адрес, база не используется.</div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ПРАВО: прогресс -->
+      <section class="card progress-card">
+        <h2 class="card-title">Ход рассылки</h2>
+        <div id="statusLine" class="status-line">Ожидание запуска</div>
+
+        <div class="bar"><div id="barFill" class="bar-fill"></div></div>
+        <div id="percentText" class="percent">0%</div>
+
+        <div class="stats">
+          <div class="stat"><div id="statSent" class="stat-num">0</div><div class="stat-label">отправлено</div></div>
+          <div class="stat"><div id="statTotal" class="stat-num">0</div><div class="stat-label">всего</div></div>
+          <div class="stat stat-err"><div id="statFailed" class="stat-num">0</div><div class="stat-label">ошибки</div></div>
+          <div class="stat"><div id="statSkipped" class="stat-num">0</div><div class="stat-label">пропущено</div></div>
+        </div>
+
+        <details class="log-wrap">
+          <summary>Журнал выполнения</summary>
+          <pre id="log" class="log"></pre>
+        </details>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
