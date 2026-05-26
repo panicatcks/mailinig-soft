@@ -363,6 +363,7 @@ class MailerApp:
         self._build_smtp_section(container, row=3)
         self._build_action_tabs(container, row=4)
         self._build_status_bar(container, row=5)
+        self._refresh_simple_pixel_status()
 
     def _build_template_section(self, parent: ttk.Frame, row: int) -> None:
         frame = ttk.LabelFrame(parent, text="Шаблон и тема", padding=10)
@@ -667,7 +668,7 @@ class MailerApp:
             self.start_row_var.set("2")
 
     def _refresh_simple_pixel_status(self) -> None:
-        if not hasattr(self, "simple_pixel_var"):
+        if not hasattr(self, "simple_pixel_var") or not hasattr(self, "hub_url_var"):
             return
         hub_url = self.hub_url_var.get().strip()
         cid = self.hub_connection_id_var.get().strip()
