@@ -658,6 +658,52 @@ def cloud_check(settings: dict) -> dict:
         return {"ok": False, "message": f"Не удалось подключиться: {message}"}
 
 
+def _resolve_state_path(state_file: str) -> Path:
+    raw = (state_file or "").strip() or ".send_email_state.json"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+def reset_daily_counter(state_file: str) -> dict:
+    """Обнулить суточный счётчик отправки (как кнопка в классике)."""
+    from datetime import date
+    path = _resolve_state_path(state_file)
+    data = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+    data["date"] = date.today().isoformat()
+    data["sent_today"] = 0
+    data["account_sent_today"] = {}
+    if not isinstance(data.get("campaigns"), dict):
+        data["campaigns"] = {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "message": "Суточный счётчик обнулён — можно отправлять дальше."}
+
+
+def reset_campaign_progress(state_file: str) -> dict:
+    """Сбросить прогресс кампаний в state-файле (рассылка начнётся с начала базы)."""
+    path = _resolve_state_path(state_file)
+    if not path.exists():
+        return {"ok": True, "message": "Прогресс уже пуст — рассылка начнётся с начала."}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["campaigns"] = {}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "message": "Прогресс сброшен — следующий запуск начнётся с начала базы."}
+
+
 def count_recipients(settings: dict) -> dict:
     """Быстрый dry-run для подсчёта получателей и проверки колонки/шаблона."""
     merged = merge_secrets(settings)
@@ -759,6 +805,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, **delete_profile(body.get("name", ""))})
             elif route == "/api/count":
                 self._send_json(count_recipients(body.get("settings", {})))
+            elif route == "/api/reset-daily":
+                self._send_json(reset_daily_counter(body.get("state_file", "")))
+            elif route == "/api/reset-progress":
+                self._send_json(reset_campaign_progress(body.get("state_file", "")))
             elif route == "/api/hub-check":
                 self._send_json(hub_check(merge_secrets(body.get("settings", {}))))
             elif route == "/api/cloud-check":

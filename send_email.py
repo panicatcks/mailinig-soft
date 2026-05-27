@@ -988,7 +988,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         for account in accounts
         if account.daily_limit is None or state.account_sent_today.get(account.key, 0) < account.daily_limit
     ]
-    if not active_accounts:
+    if not active_accounts and not args.dry_run:
         wait_text = format_wait_until_midnight()
         raise RuntimeError(f"ratelimit wait {wait_text}")
 

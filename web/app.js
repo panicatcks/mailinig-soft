@@ -258,6 +258,18 @@ async function refreshProgress() {
   }
 }
 
+async function resetDaily() {
+  if (!window.confirm("Обнулить счётчик отправленных за сегодня?")) return;
+  const r = await api("/api/reset-daily", { state_file: activeStateFile });
+  toast(r.message || "Готово", r.ok ? "ok" : "err");
+}
+
+async function resetProgress() {
+  if (!window.confirm("Сбросить прогресс? Рассылка начнётся с первой строки базы.")) return;
+  const r = await api("/api/reset-progress", { state_file: activeStateFile });
+  toast(r.message || "Готово", r.ok ? "ok" : "err");
+}
+
 async function hubCheck() {
   $("hubStatus").textContent = "проверяю…";
   const r = await api("/api/hub-check", { settings: collectSettings() });
@@ -289,6 +301,8 @@ async function init() {
     if (!email) return toast("Укажи email для теста", "err");
     start(false, [email]);
   });
+  $("resetDailyBtn").addEventListener("click", resetDaily);
+  $("resetProgressBtn").addEventListener("click", resetProgress);
   $("hubCheckBtn").addEventListener("click", hubCheck);
   $("cloudCheckBtn").addEventListener("click", cloudCheck);
   $("cloud_enabled").addEventListener("change", refreshCloudPill);

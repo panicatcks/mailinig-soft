@@ -72,6 +72,7 @@ body {
 }
 .btn-sm { padding: 8px 12px; font-size: 13px; }
 
+.reset-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 .detect-hint { margin-top: 8px; display: block; }
 .detect-hint.ok { color: #7ee2a8; }
 .detect-hint.err { color: #ff9a93; }
