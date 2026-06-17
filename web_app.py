@@ -105,6 +105,16 @@ def save_config(incoming: dict) -> dict:
             continue
         current[key] = value
     CONFIG_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Если открыта именованная сессия — автоматически сохраняем её тоже,
+    # чтобы при переключении не терялись настройки/прогресс.
+    try:
+        store = read_profiles_store()
+        active = str(store.get("active", "")).strip()
+        if active and active in store.get("profiles", {}):
+            store["profiles"][active] = dict(current)
+            write_profiles_store(store)
+    except Exception:
+        pass
     return current
 
 
@@ -704,6 +714,134 @@ def reset_campaign_progress(state_file: str) -> dict:
     return {"ok": True, "message": "Прогресс сброшен — следующий запуск начнётся с начала базы."}
 
 
+# --------------------------------------------------------------------------- #
+# Валидатор email-базы (фон)
+# --------------------------------------------------------------------------- #
+class ValidatorJob:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._cancel = threading.Event()
+        self.state: dict = {"running": False, "finished": False}
+
+    def status(self) -> dict:
+        with self._lock:
+            return dict(self.state)
+
+    def stop(self) -> dict:
+        self._cancel.set()
+        return {"ok": True, "message": "Остановлено"}
+
+    def start(self, to_file: str, email_col: str, start_row: int) -> dict:
+        with self._lock:
+            if self.state.get("running"):
+                return {"ok": False, "message": "Проверка уже идёт"}
+            self._cancel.clear()
+            self.state = {
+                "running": True, "finished": False, "done": 0, "total": 0,
+                "ok_count": 0, "bad_count": 0, "src": to_file,
+                "cleaned_path": "", "bad_path": "", "report_path": "",
+                "message": "Готовлю список адресов…", "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        self._thread = threading.Thread(
+            target=self._run, args=(to_file, email_col, start_row), daemon=True)
+        self._thread.start()
+        return {"ok": True}
+
+    def _set(self, **kwargs) -> None:
+        with self._lock:
+            self.state.update(kwargs)
+
+    def _run(self, to_file: str, email_col: str, start_row: int) -> None:
+        import email_validator as ev
+        try:
+            src = Path(to_file).expanduser().resolve()
+            if not src.exists():
+                self._set(running=False, finished=True, message=f"Файл не найден: {src}")
+                return
+            is_xlsx = src.suffix.lower() in {".xlsx", ".xlsm"}
+            if is_xlsx:
+                emails, _ = ev._read_xlsx_emails(src, email_col, int(start_row or 2))
+            else:
+                emails = ev._read_text_emails(src)
+            total = len(emails)
+            if total == 0:
+                self._set(running=False, finished=True, message="В файле нет адресов.")
+                return
+            self._set(total=total, message=f"Проверяю {total} адресов…")
+
+            results: list[dict] = []
+
+            def on_progress(done: int, _total: int, r: dict) -> None:
+                if self._cancel.is_set():
+                    return
+                if r.get("ok"):
+                    with self._lock:
+                        self.state["ok_count"] = self.state.get("ok_count", 0) + 1
+                else:
+                    with self._lock:
+                        self.state["bad_count"] = self.state.get("bad_count", 0) + 1
+                self._set(done=done)
+
+            # Используем validate_emails, но с возможностью прерывания через cancel
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                futures = {pool.submit(ev.validate_one, e): i for i, e in enumerate(emails)}
+                results = [None] * total
+                done = 0
+                for fut in as_completed(futures):
+                    if self._cancel.is_set():
+                        for f in futures:
+                            f.cancel()
+                        self._set(running=False, finished=True, message="Прервано")
+                        return
+                    i = futures[fut]
+                    try:
+                        r = fut.result()
+                    except Exception as exc:
+                        r = {"email": emails[i], "ok": False, "reason": f"error: {exc}"}
+                    results[i] = r
+                    done += 1
+                    on_progress(done, total, r)
+
+            bad = [r for r in results if r and not r["ok"]]
+            ok_results = [r for r in results if r and r["ok"]]
+            bad_set = {r["email"].strip() for r in bad}
+
+            stem = src.stem
+            cleaned_path = src.with_name(f"{stem}_очищенный{src.suffix}")
+            bad_path = src.with_name(f"{stem}_невалидные.txt")
+            report_path = src.with_name(f"{stem}_отчёт.csv")
+
+            bad_path.write_text("\n".join(r["email"] for r in bad), encoding="utf-8")
+            import csv as _csv
+            with report_path.open("w", encoding="utf-8", newline="") as f:
+                w = _csv.writer(f)
+                w.writerow(["email", "ok", "reason"])
+                for r in results:
+                    if r:
+                        w.writerow([r["email"], "1" if r["ok"] else "0", r["reason"]])
+
+            removed = 0
+            if is_xlsx:
+                removed = ev._write_xlsx_cleaned(src, cleaned_path, bad_set, email_col, int(start_row or 2))
+            else:
+                cleaned_path.write_text("\n".join(r["email"] for r in ok_results), encoding="utf-8")
+                removed = len(bad)
+
+            self._set(
+                running=False, finished=True,
+                cleaned_path=str(cleaned_path), bad_path=str(bad_path), report_path=str(report_path),
+                message=f"Готово. Валидных: {len(ok_results)}, удалено: {removed}. "
+                        f"Очищенный файл: {cleaned_path.name}",
+            )
+        except Exception as exc:
+            self._set(running=False, finished=True, message=f"Ошибка: {exc}")
+
+
+VALIDATOR = ValidatorJob()
+
+
 def count_recipients(settings: dict) -> dict:
     """Быстрый dry-run для подсчёта получателей и проверки колонки/шаблона."""
     merged = merge_secrets(settings)
@@ -779,6 +917,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(list_profiles())
         elif route == "/api/progress":
             self._send_json(MANAGER.progress())
+        elif route == "/api/validate-progress":
+            self._send_json(VALIDATOR.status())
         else:
             self.send_error(404, "Not found")
 
@@ -827,6 +967,14 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/cloud-reset":
                 MANAGER.reset_cloud()
                 self._send_json({"ok": True})
+            elif route == "/api/validate-start":
+                self._send_json(VALIDATOR.start(
+                    body.get("to_file", ""),
+                    body.get("email_col", "A"),
+                    int(body.get("start_row", 2) or 2),
+                ))
+            elif route == "/api/validate-stop":
+                self._send_json(VALIDATOR.stop())
             else:
                 self.send_error(404, "Not found")
         except Exception as error:

@@ -147,6 +147,21 @@
           </div>
 
           <div class="adv-group">
+            <h3>Очистка базы от невалидных email</h3>
+            <div class="muted" style="margin-bottom:10px;">
+              Проверяет каждый адрес: правильный синтаксис и существует ли почтовый сервер у домена (MX/A-запись).
+              Невалидные удаляются — Timeweb перестаёт банить за рассылку «в никуда».
+              <br>Результат: <code>файл_очищенный.xlsx</code>, <code>файл_невалидные.txt</code>, <code>файл_отчёт.csv</code> — рядом с исходным.
+            </div>
+            <div class="row">
+              <button id="validateStartBtn" class="btn">🩺 Проверить базу</button>
+              <button id="validateStopBtn" class="btn btn-danger" disabled>Стоп</button>
+            </div>
+            <div class="bar" style="margin-top:12px;"><div id="validateBar" class="bar-fill"></div></div>
+            <div id="validateStatus" class="hint" style="margin-top:8px;">Возьму файл из шага 1, колонку email из шага 2.</div>
+          </div>
+
+          <div class="adv-group">
             <h3>Тестовое письмо</h3>
             <div class="row">
               <input id="test_email" placeholder="you@example.com" />

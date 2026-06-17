@@ -270,6 +270,46 @@ async function resetProgress() {
   toast(r.message || "Готово", r.ok ? "ok" : "err");
 }
 
+// --- валидатор базы ---
+let validateTimer = null;
+async function validateStart() {
+  const file = $("toFile").value.trim();
+  if (!file) return toast("Сначала выбери базу (шаг 1)", "err");
+  const col = $("emailCol").value.trim() || "A";
+  const startRow = parseInt($("start_row").value.trim() || "2", 10);
+  const r = await api("/api/validate-start", { to_file: file, email_col: col, start_row: startRow });
+  if (!r.ok) return toast(r.message || "Не удалось запустить проверку", "err");
+  $("validateStartBtn").disabled = true;
+  $("validateStopBtn").disabled = false;
+  $("validateStatus").textContent = "Запускаю…";
+  if (validateTimer) clearInterval(validateTimer);
+  validateTimer = setInterval(refreshValidate, 800);
+  refreshValidate();
+}
+
+async function validateStop() {
+  await api("/api/validate-stop", {});
+}
+
+async function refreshValidate() {
+  const s = await api("/api/validate-progress");
+  const total = s.total || 0;
+  const done = s.done || 0;
+  const pct = total ? Math.round(done / total * 100) : 0;
+  $("validateBar").style.width = Math.min(pct, 100) + "%";
+  const okN = s.ok_count || 0, badN = s.bad_count || 0;
+  let line = s.message || "";
+  if (s.running) line = `${done}/${total} · валидных ${okN}, плохих ${badN}`;
+  $("validateStatus").textContent = line;
+  $("validateStatus").className = "hint" + (s.finished && !s.running ? " ok" : "");
+  if (s.finished && !s.running) {
+    $("validateStartBtn").disabled = false;
+    $("validateStopBtn").disabled = true;
+    if (validateTimer) { clearInterval(validateTimer); validateTimer = null; }
+    if (s.cleaned_path) toast("Очищенный файл: " + s.cleaned_path.split("/").pop(), "ok");
+  }
+}
+
 async function hubCheck() {
   $("hubStatus").textContent = "проверяю…";
   const r = await api("/api/hub-check", { settings: collectSettings() });
@@ -303,6 +343,8 @@ async function init() {
   });
   $("resetDailyBtn").addEventListener("click", resetDaily);
   $("resetProgressBtn").addEventListener("click", resetProgress);
+  $("validateStartBtn").addEventListener("click", validateStart);
+  $("validateStopBtn").addEventListener("click", validateStop);
   $("hubCheckBtn").addEventListener("click", hubCheck);
   $("cloudCheckBtn").addEventListener("click", cloudCheck);
   $("cloud_enabled").addEventListener("change", refreshCloudPill);
