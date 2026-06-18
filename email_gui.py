@@ -583,6 +583,7 @@ class MailerApp:
         simple_tab = ttk.Frame(notebook, padding=10)
         send_tab = ttk.Frame(notebook, padding=10)
         test_tab = ttk.Frame(notebook, padding=10)
+        validate_tab = ttk.Frame(notebook, padding=10)
         hub_tab = ttk.Frame(notebook, padding=10)
         cloud_tab = ttk.Frame(notebook, padding=10)
         log_tab = ttk.Frame(notebook, padding=10)
@@ -591,6 +592,7 @@ class MailerApp:
         notebook.add(simple_tab, text="Просто")
         notebook.add(send_tab, text="Рассылка")
         notebook.add(test_tab, text="Тест")
+        notebook.add(validate_tab, text="Проверка")
         notebook.add(hub_tab, text="Хаб")
         notebook.add(cloud_tab, text="Облако")
         notebook.add(log_tab, text="Логи")
@@ -598,6 +600,7 @@ class MailerApp:
         self._build_simple_controls(simple_tab)
         self._build_send_controls(send_tab)
         self._build_test_controls(test_tab)
+        self._build_validate_controls(validate_tab)
         self._build_hub_controls(hub_tab)
         self._build_cloud_controls(cloud_tab)
         self._build_log_section(log_tab)
@@ -812,6 +815,182 @@ class MailerApp:
             frame,
             text="Тест отправляется только на указанный email, база получателей не используется.",
         ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
+    def _build_validate_controls(self, frame: ttk.Frame) -> None:
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(5, weight=1)
+
+        ttk.Label(
+            frame,
+            text="Проверка базы: каждый адрес проверяется на синтаксис и наличие MX/A-записи у домена. "
+                 "Невалидные удаляются — Timeweb перестаёт банить за рассылку «в никуда».",
+            wraplength=720,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(frame, text="Файл базы:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(frame, textvariable=self.to_file_var).grid(row=1, column=1, sticky="ew")
+        ttk.Button(frame, text="Выбрать", command=self._pick_excel).grid(row=1, column=2, padx=(8, 0))
+
+        ttk.Label(frame, text="Колонка email:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        row2 = ttk.Frame(frame)
+        row2.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Entry(row2, textvariable=self.email_col_var, width=8).grid(row=0, column=0)
+        ttk.Label(row2, text="   Начать со строки:").grid(row=0, column=1, padx=(8, 4))
+        ttk.Entry(row2, textvariable=self.start_row_var, width=6).grid(row=0, column=2)
+
+        actions = ttk.Frame(frame)
+        actions.grid(row=3, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        self.validate_start_btn = ttk.Button(actions, text="🩺 Проверить базу", command=self._start_validation)
+        self.validate_start_btn.grid(row=0, column=0)
+        self.validate_stop_btn = ttk.Button(actions, text="Стоп", command=self._stop_validation, state="disabled")
+        self.validate_stop_btn.grid(row=0, column=1, padx=(8, 0))
+
+        self.validate_progress_var = tk.StringVar(value="Готов к проверке.")
+        ttk.Label(frame, textvariable=self.validate_progress_var).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(10, 4)
+        )
+
+        from tkinter.scrolledtext import ScrolledText
+        self.validate_log = ScrolledText(frame, height=14, wrap="word")
+        self.validate_log.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        self.validate_log.configure(state="disabled")
+
+        self._validate_cancel = None
+        self._validate_thread = None
+
+    def _validate_log_append(self, text: str) -> None:
+        self.validate_log.configure(state="normal")
+        self.validate_log.insert("end", text + "\n")
+        self.validate_log.see("end")
+        self.validate_log.configure(state="disabled")
+
+    def _start_validation(self) -> None:
+        import threading
+        from pathlib import Path as _Path
+        from tkinter import messagebox as _mb
+        src_raw = self.to_file_var.get().strip()
+        if not src_raw:
+            _mb.showwarning("Проверка", "Сначала выбери файл базы.")
+            return
+        src = _Path(src_raw).expanduser().resolve()
+        if not src.exists():
+            _mb.showerror("Проверка", f"Файл не найден: {src}")
+            return
+        col = (self.email_col_var.get() or "A").strip()
+        try:
+            start_row = int(self.start_row_var.get() or "2")
+        except ValueError:
+            start_row = 2
+
+        self.validate_log.configure(state="normal")
+        self.validate_log.delete("1.0", "end")
+        self.validate_log.configure(state="disabled")
+        self.validate_progress_var.set("Загружаю адреса…")
+        self.validate_start_btn.configure(state="disabled")
+        self.validate_stop_btn.configure(state="normal")
+
+        self._validate_cancel = threading.Event()
+        cancel = self._validate_cancel
+
+        def worker():
+            import email_validator as ev
+            import csv as _csv
+            try:
+                is_xlsx = src.suffix.lower() in {".xlsx", ".xlsm"}
+                if is_xlsx:
+                    emails, _ = ev._read_xlsx_emails(src, col, start_row)
+                else:
+                    emails = ev._read_text_emails(src)
+                total = len(emails)
+                if total == 0:
+                    self.root.after(0, lambda: self._finish_validation("В файле нет адресов.", None))
+                    return
+                self.root.after(0, lambda: self._validate_log_append(f"Загружено {total} адресов. Проверяю…"))
+
+                results = [None] * total
+                ok_n = bad_n = 0
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=16) as pool:
+                    futures = {pool.submit(ev.validate_one, e): i for i, e in enumerate(emails)}
+                    done = 0
+                    last_pct = -1
+                    for fut in as_completed(futures):
+                        if cancel.is_set():
+                            for f in futures:
+                                f.cancel()
+                            self.root.after(0, lambda: self._finish_validation("Прервано пользователем.", None))
+                            return
+                        i = futures[fut]
+                        try:
+                            r = fut.result()
+                        except Exception as exc:
+                            r = {"email": emails[i], "ok": False, "reason": f"error: {exc}"}
+                        results[i] = r
+                        if r["ok"]:
+                            ok_n += 1
+                        else:
+                            bad_n += 1
+                        done += 1
+                        pct = int(done / total * 100)
+                        if pct != last_pct:
+                            last_pct = pct
+                            self.root.after(0, lambda d=done, t=total, ok=ok_n, bad=bad_n:
+                                            self.validate_progress_var.set(
+                                                f"{d}/{t}  ·  валидных {ok}, плохих {bad}"))
+
+                bad = [r for r in results if r and not r["ok"]]
+                ok_results = [r for r in results if r and r["ok"]]
+                bad_set = {r["email"].strip() for r in bad}
+
+                stem = src.stem
+                cleaned = src.with_name(f"{stem}_очищенный{src.suffix}")
+                bad_path = src.with_name(f"{stem}_невалидные.txt")
+                report_path = src.with_name(f"{stem}_отчёт.csv")
+
+                bad_path.write_text("\n".join(r["email"] for r in bad), encoding="utf-8")
+                with report_path.open("w", encoding="utf-8", newline="") as f:
+                    w = _csv.writer(f)
+                    w.writerow(["email", "ok", "reason"])
+                    for r in results:
+                        if r:
+                            w.writerow([r["email"], "1" if r["ok"] else "0", r["reason"]])
+
+                if is_xlsx:
+                    removed = ev._write_xlsx_cleaned(src, cleaned, bad_set, col, start_row)
+                else:
+                    cleaned.write_text("\n".join(r["email"] for r in ok_results), encoding="utf-8")
+                    removed = len(bad)
+
+                by_reason = {}
+                for r in bad:
+                    by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
+                reason_lines = "\n".join(f"  {k}: {v}" for k, v in sorted(by_reason.items(), key=lambda x: -x[1]))
+
+                summary = (
+                    f"\nГотово. Валидных: {len(ok_results)}, удалено: {removed}\n"
+                    f"{reason_lines}\n\n"
+                    f"Очищенный файл: {cleaned}\n"
+                    f"Список невалидных: {bad_path}\n"
+                    f"Отчёт: {report_path}"
+                )
+                self.root.after(0, lambda: self._finish_validation(
+                    f"Готово. Валидных {len(ok_results)}, удалено {removed}.", summary))
+            except Exception as exc:
+                self.root.after(0, lambda: self._finish_validation(f"Ошибка: {exc}", None))
+
+        self._validate_thread = threading.Thread(target=worker, daemon=True)
+        self._validate_thread.start()
+
+    def _stop_validation(self) -> None:
+        if self._validate_cancel:
+            self._validate_cancel.set()
+
+    def _finish_validation(self, status_text: str, summary: str | None) -> None:
+        self.validate_progress_var.set(status_text)
+        if summary:
+            self._validate_log_append(summary)
+        self.validate_start_btn.configure(state="normal")
+        self.validate_stop_btn.configure(state="disabled")
 
     def _build_hub_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
