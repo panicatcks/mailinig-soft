@@ -21,6 +21,9 @@ EXCLUDED_NAMES = {
     "venv",
     ".idea",
     ".pytest_cache",
+    "state_profiles",
+    ".cloud_runs",
+    "logs",
 }
 EXCLUDED_SUFFIXES = {
     ".pyc",
@@ -293,6 +296,17 @@ class CloudRuntime:
             if isinstance(data, (bytes, bytearray)):
                 return data.decode("utf-8", errors="replace")
             return str(data)
+
+    def download_file(self, remote_path: str, local_path: Path) -> bool:
+        """Скачивает файл с сервера в local_path. True если файл существовал."""
+        _, sftp = self._require_client()
+        try:
+            sftp.stat(remote_path)
+        except OSError:
+            return False
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        sftp.get(remote_path, str(local_path))
+        return True
 
     def upload_text_file(self, remote_path: str, content: str) -> None:
         _, sftp = self._require_client()

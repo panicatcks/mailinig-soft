@@ -107,7 +107,11 @@ class MailerApp:
     def _ensure_profile_state_data(self, profile_name: str, data: dict) -> dict:
         profile_data = dict(data)
         current = str(profile_data.get("state_file", "")).strip()
-        if not current:
+        # Общий дефолтный state недопустим для профиля — у каждого свой файл,
+        # иначе счётчики/курсоры сессий перетирают друг друга.
+        shared_defaults = {"", ".send_email_state.json",
+                           str((BASE_DIR / ".send_email_state.json"))}
+        if current in shared_defaults:
             profile_data["state_file"] = str(self._profile_state_path(profile_name))
         return profile_data
 
@@ -194,6 +198,8 @@ class MailerApp:
             self._write_profiles_store(store)
         names = sorted(profiles.keys()) if isinstance(profiles, dict) else []
         self.profile_combo.configure(values=names)
+        if hasattr(self, "_cloud_profile_combo"):
+            self._cloud_profile_combo.configure(values=names)
         target = selected if selected is not None else store.get("active", "")
         if target in names:
             self.profile_var.set(target)
@@ -818,7 +824,7 @@ class MailerApp:
 
     def _build_validate_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(5, weight=1)
+        frame.rowconfigure(6, weight=1)
 
         ttk.Label(
             frame,
@@ -838,21 +844,28 @@ class MailerApp:
         ttk.Label(row2, text="   Начать со строки:").grid(row=0, column=1, padx=(8, 4))
         ttk.Entry(row2, textvariable=self.start_row_var, width=6).grid(row=0, column=2)
 
+        self.validate_dedup_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text="Удалять дубликаты email (по всем листам книги)",
+            variable=self.validate_dedup_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         actions = ttk.Frame(frame)
-        actions.grid(row=3, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        actions.grid(row=4, column=0, columnspan=3, sticky="w", pady=(14, 0))
         self.validate_start_btn = ttk.Button(actions, text="🩺 Проверить базу", command=self._start_validation)
         self.validate_start_btn.grid(row=0, column=0)
         self.validate_stop_btn = ttk.Button(actions, text="Стоп", command=self._stop_validation, state="disabled")
         self.validate_stop_btn.grid(row=0, column=1, padx=(8, 0))
 
         self.validate_progress_var = tk.StringVar(value="Готов к проверке.")
-        ttk.Label(frame, textvariable=self.validate_progress_var).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(10, 4)
-        )
+        ttk.Label(
+            frame, textvariable=self.validate_progress_var, style="Header.TLabel"
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 4))
 
         from tkinter.scrolledtext import ScrolledText
         self.validate_log = ScrolledText(frame, height=14, wrap="word")
-        self.validate_log.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        self.validate_log.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
         self.validate_log.configure(state="disabled")
 
         self._validate_cancel = None
@@ -889,14 +902,22 @@ class MailerApp:
         self.validate_start_btn.configure(state="disabled")
         self.validate_stop_btn.configure(state="normal")
 
+        dedup = bool(self.validate_dedup_var.get())
         self._validate_cancel = threading.Event()
         cancel = self._validate_cancel
+
+        def log(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self._validate_log_append(m))
+
+        def status(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self.validate_progress_var.set(m))
 
         def worker():
             import email_validator as ev
             import csv as _csv
             try:
                 is_xlsx = src.suffix.lower() in {".xlsx", ".xlsm"}
+                status("Загружаю адреса из файла…")
                 if is_xlsx:
                     emails, _ = ev._read_xlsx_emails(src, col, start_row)
                 else:
@@ -905,7 +926,9 @@ class MailerApp:
                 if total == 0:
                     self.root.after(0, lambda: self._finish_validation("В файле нет адресов.", None))
                     return
-                self.root.after(0, lambda: self._validate_log_append(f"Загружено {total} адресов. Проверяю…"))
+                uniq = len({e.strip().lower() for e in emails})
+                log(f"Загружено {total} адресов ({uniq} уникальных). Проверяю MX/синтаксис…")
+                status(f"0/{total}  ·  проверяю…")
 
                 results = [None] * total
                 ok_n = bad_n = 0
@@ -914,6 +937,7 @@ class MailerApp:
                     futures = {pool.submit(ev.validate_one, e): i for i, e in enumerate(emails)}
                     done = 0
                     last_pct = -1
+                    log_step = max(total // 20, 1)  # ~20 строк лога за прогон
                     for fut in as_completed(futures):
                         if cancel.is_set():
                             for f in futures:
@@ -934,9 +958,9 @@ class MailerApp:
                         pct = int(done / total * 100)
                         if pct != last_pct:
                             last_pct = pct
-                            self.root.after(0, lambda d=done, t=total, ok=ok_n, bad=bad_n:
-                                            self.validate_progress_var.set(
-                                                f"{d}/{t}  ·  валидных {ok}, плохих {bad}"))
+                            status(f"{done}/{total} ({pct}%)  ·  валидных {ok_n}, плохих {bad_n}")
+                        if done % log_step == 0:
+                            log(f"  …{done}/{total} проверено (валидных {ok_n}, плохих {bad_n})")
 
                 bad = [r for r in results if r and not r["ok"]]
                 ok_results = [r for r in results if r and r["ok"]]
@@ -947,6 +971,7 @@ class MailerApp:
                 bad_path = src.with_name(f"{stem}_невалидные.txt")
                 report_path = src.with_name(f"{stem}_отчёт.csv")
 
+                status("Записываю очищенный файл…")
                 bad_path.write_text("\n".join(r["email"] for r in bad), encoding="utf-8")
                 with report_path.open("w", encoding="utf-8", newline="") as f:
                     w = _csv.writer(f)
@@ -955,28 +980,47 @@ class MailerApp:
                         if r:
                             w.writerow([r["email"], "1" if r["ok"] else "0", r["reason"]])
 
+                removed_dup = 0
                 if is_xlsx:
-                    removed = ev._write_xlsx_cleaned(src, cleaned, bad_set, col, start_row)
+                    removed_bad, removed_dup = ev._write_xlsx_clean_dedup(
+                        src, cleaned, bad_set, dedup, col, start_row
+                    )
                 else:
-                    cleaned.write_text("\n".join(r["email"] for r in ok_results), encoding="utf-8")
-                    removed = len(bad)
+                    seen = set()
+                    kept = []
+                    for r in ok_results:
+                        key = r["email"].strip().lower()
+                        if dedup and key in seen:
+                            removed_dup += 1
+                            continue
+                        seen.add(key)
+                        kept.append(r["email"])
+                    cleaned.write_text("\n".join(kept), encoding="utf-8")
+                    removed_bad = len(bad)
 
                 by_reason = {}
                 for r in bad:
                     by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
                 reason_lines = "\n".join(f"  {k}: {v}" for k, v in sorted(by_reason.items(), key=lambda x: -x[1]))
+                dup_line = f"Удалено дубликатов: {removed_dup}\n" if dedup else ""
 
                 summary = (
-                    f"\nГотово. Валидных: {len(ok_results)}, удалено: {removed}\n"
+                    f"\nГотово. Валидных: {len(ok_results)}, удалено невалидных: {removed_bad}\n"
+                    f"{dup_line}"
                     f"{reason_lines}\n\n"
                     f"Очищенный файл: {cleaned}\n"
                     f"Список невалидных: {bad_path}\n"
                     f"Отчёт: {report_path}"
                 )
-                self.root.after(0, lambda: self._finish_validation(
-                    f"Готово. Валидных {len(ok_results)}, удалено {removed}.", summary))
-            except Exception as exc:
-                self.root.after(0, lambda: self._finish_validation(f"Ошибка: {exc}", None))
+                final_status = (
+                    f"Готово. Валидных {len(ok_results)}, "
+                    f"невалидных {removed_bad}"
+                    + (f", дублей {removed_dup}" if dedup else "")
+                    + "."
+                )
+                self.root.after(0, lambda: self._finish_validation(final_status, summary))
+            except BaseException as exc:  # noqa: BLE001 — SystemExit из openpyxl тоже показываем
+                self.root.after(0, lambda e=exc: self._finish_validation(f"Ошибка: {e}", None))
 
         self._validate_thread = threading.Thread(target=worker, daemon=True)
         self._validate_thread.start()
@@ -1062,21 +1106,40 @@ class MailerApp:
         ttk.Label(frame, text="Папка на сервере:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Entry(frame, textvariable=self.server_remote_dir_var).grid(row=3, column=1, columnspan=3, sticky="ew", pady=(8, 0))
 
+        run_frame = ttk.LabelFrame(frame, text="Запуск профиля в облаке", padding=8)
+        run_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        run_frame.columnconfigure(1, weight=1)
+        ttk.Label(run_frame, text="Профиль:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        cloud_profile_combo = ttk.Combobox(
+            run_frame, textvariable=self.profile_var, state="readonly", width=26
+        )
+        cloud_profile_combo.grid(row=0, column=1, sticky="w")
+        self._cloud_profile_combo = cloud_profile_combo
+        cloud_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_selected_profile())
+        ttk.Button(run_frame, text="Загрузить", command=self._load_selected_profile).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(
+            run_frame, text="▶ Запустить в облаке", command=self._run_current_profile_in_cloud
+        ).grid(row=0, column=3, padx=(8, 0))
+        ttk.Label(
+            run_frame,
+            text="Выбери сессию → «Запустить в облаке». Счётчик суток и state сами подтянутся с сервера.",
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
         actions = ttk.Frame(frame)
-        actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        actions.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(actions, text="Инициализация сервера", command=self._initialize_server).grid(row=0, column=0)
         ttk.Button(actions, text="Проверить обновления", command=self._check_for_updates).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(actions, text="Обновить программу", command=self._apply_update).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(actions, text="Статус облачной задачи", command=self._check_cloud_task_status).grid(row=0, column=3, padx=(8, 0))
 
-        ttk.Label(frame, text="Статус облака:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
-        ttk.Label(frame, textvariable=self.cloud_status_var).grid(row=5, column=1, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Label(frame, text="Статус обновлений:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Label(frame, textvariable=self.update_status_var).grid(row=6, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="Статус облака:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        ttk.Label(frame, textvariable=self.cloud_status_var).grid(row=6, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(frame, text="Статус обновлений:").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Label(frame, textvariable=self.update_status_var).grid(row=7, column=1, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(
             frame,
             text="При облачном режиме задача продолжает выполняться на сервере даже если GUI закрыт.",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
     def _build_server_config(self) -> ServerConfig:
         host = self.server_host_var.get().strip()
@@ -1371,8 +1434,16 @@ class MailerApp:
         campaign_key = self._build_campaign_key_for_ui()
         data = self._load_state_json()
         self.state_campaign_key_var.set(campaign_key)
-        self.state_date_var.set(str(data.get("date", "—")))
-        self.state_sent_today_var.set(str(self._safe_int(str(data.get("sent_today", 0)), 0)))
+        today = date.today().isoformat()
+        stored_date = str(data.get("date", "")).strip()
+        # Суточный счётчик обнуляется при смене даты (так делает send_email.py),
+        # поэтому в новый день показываем 0, а не «зависшее» вчерашнее число.
+        if stored_date and stored_date != today:
+            self.state_date_var.set(f"{today} (в файле {stored_date} → сброс)")
+            self.state_sent_today_var.set("0")
+        else:
+            self.state_date_var.set(stored_date or "—")
+            self.state_sent_today_var.set(str(self._safe_int(str(data.get("sent_today", 0)), 0)))
         campaigns = data.get("campaigns", {})
         campaign = campaigns.get(campaign_key, {}) if isinstance(campaigns, dict) else {}
         cursor_value = self._safe_int(str(campaign.get("cursor_index", 0)), 0)
@@ -1587,6 +1658,26 @@ class MailerApp:
         status = str(payload.get("status", "")).lower()
         if status in {"completed", "stopped", "failed"}:
             self._finalize_progress_ui()
+
+    def _pull_cloud_state(self, runtime: CloudRuntime, cmd: list[str], remote_cmd: list[str]) -> None:
+        """Скачивает state-файл (и progress) с сервера обратно в локальные пути.
+
+        Без этого GUI после облачного прогона показывал устаревший локальный state.
+        """
+        local_state = self._extract_flag_value(cmd, "--state-file")
+        remote_state = self._extract_flag_value(remote_cmd, "--state-file")
+        if not local_state or not remote_state:
+            return
+        try:
+            local_path = Path(local_state).expanduser().resolve()
+            pulled = runtime.download_file(remote_state, local_path)
+            if pulled:
+                self.log_queue.put(f"[Cloud] State синхронизирован с сервера → {local_path}\n")
+                self.root.after(0, self._refresh_state_info)
+            else:
+                self.log_queue.put("[Cloud] State-файл на сервере не найден (возможно, ещё не создан).\n")
+        except Exception as error:
+            self.log_queue.put(f"[Cloud] Не удалось скачать state: {error}\n")
 
     def _read_remote_progress_payload(self, runtime: CloudRuntime, progress_file: str) -> dict | None:
         if not progress_file:
@@ -1829,6 +1920,18 @@ class MailerApp:
                 else:
                     code_view = "unknown" if exit_code is None else str(exit_code)
                     self.log_queue.put(f"[Cloud] Задача завершена. Код: {code_view}\n")
+                    remote_state = task.get("remote_state_file", "")
+                    local_state = task.get("local_state_file", "")
+                    if remote_state and local_state:
+                        try:
+                            local_path = Path(local_state).expanduser().resolve()
+                            if runtime.download_file(remote_state, local_path):
+                                self.log_queue.put(
+                                    f"[Cloud] State синхронизирован с сервера → {local_path}\n"
+                                )
+                                self.root.after(0, self._refresh_state_info)
+                        except Exception as error:
+                            self.log_queue.put(f"[Cloud] Не удалось скачать state: {error}\n")
                     self._set_status_async("Облачная задача завершена")
                     self.remote_run_id = None
                     self.remote_task_meta = None
@@ -1845,6 +1948,19 @@ class MailerApp:
         self._start_process(force_dry_run=True)
 
     def _start_send(self) -> None:
+        self._start_process(force_dry_run=False)
+
+    def _run_current_profile_in_cloud(self) -> None:
+        if not self.server_host_var.get().strip():
+            messagebox.showerror(
+                "Облако", "Заполните IP/домен сервера и SSH-доступ на вкладке «Облако»."
+            )
+            return
+        profile = self.profile_var.get().strip()
+        if not self.cloud_enabled_var.get():
+            self.cloud_enabled_var.set(True)
+        note = f" (профиль: {profile})" if profile else ""
+        self._append_log(f"\n[Cloud] Запуск текущего профиля в облаке{note}...\n")
         self._start_process(force_dry_run=False)
 
     def _start_test_dry_run(self) -> None:
@@ -1980,6 +2096,12 @@ class MailerApp:
                     progress_file = self._extract_flag_value(remote_cmd, "--progress-file")
                     if progress_file:
                         task["progress_file"] = progress_file
+                    remote_state = self._extract_flag_value(remote_cmd, "--state-file")
+                    local_state = self._extract_flag_value(cmd, "--state-file")
+                    if remote_state:
+                        task["remote_state_file"] = remote_state
+                    if local_state:
+                        task["local_state_file"] = local_state
                     self.remote_run_id = task["run_id"]
                     self.remote_task_meta = task
                     self._persist_cloud_last_task()
@@ -2003,6 +2125,7 @@ class MailerApp:
                             code = 0 if exit_code is None else exit_code
                             break
                         time.sleep(0.35)
+                    self._pull_cloud_state(runtime, cmd, remote_cmd)
                     self.remote_run_id = None
                     self.remote_task_meta = None
                     self._persist_cloud_last_task()

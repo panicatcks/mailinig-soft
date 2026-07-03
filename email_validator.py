@@ -197,6 +197,55 @@ def _write_xlsx_cleaned(src: Path, dest: Path, bad_set: set[str], email_col: str
     return removed
 
 
+def _write_xlsx_clean_dedup(
+    src: Path,
+    dest: Path,
+    bad_set: set[str],
+    dedup: bool,
+    email_col: str,
+    start_row: int = 2,
+) -> tuple[int, int]:
+    """Чистит xlsx: удаляет невалидные и (опц.) повторные адреса по всем листам.
+
+    Дубликаты считаются глобально по всей книге (первое вхождение остаётся).
+    Возвращает (удалено_невалидных, удалено_дубликатов).
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        sys.exit("openpyxl нужен для записи xlsx.")
+    wb = load_workbook(src)
+    col_idx = _col_to_index(email_col)
+    removed_bad = 0
+    removed_dup = 0
+    seen: set[str] = set()
+    for ws in wb.worksheets:
+        rows_to_delete: list[int] = []
+        for r in range(start_row, ws.max_row + 1):
+            cell = ws.cell(row=r, column=col_idx + 1).value
+            if cell is None:
+                continue
+            email = str(cell).strip()
+            if not email:
+                continue
+            key = email.lower()
+            if email in bad_set:
+                rows_to_delete.append(r)
+                removed_bad += 1
+                continue
+            if dedup:
+                if key in seen:
+                    rows_to_delete.append(r)
+                    removed_dup += 1
+                    continue
+                seen.add(key)
+        for r in reversed(rows_to_delete):
+            ws.delete_rows(r, 1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(dest)
+    return removed_bad, removed_dup
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Очистка списка email от невалидных адресов.")
     ap.add_argument("--in", dest="src", required=True, help="Исходный файл (.xlsx/.csv/.txt)")
