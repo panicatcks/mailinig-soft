@@ -57,6 +57,8 @@ class MailerApp:
         self._suspend_dirty_tracking = True
         self.server_init_in_progress = False
         self.smtp_accounts: list[dict] = []
+        self.cloud_sessions: dict[str, dict] = {}
+        self._cloud_monitor_running = False
 
         self._setup_style()
         self._build_ui()
@@ -200,6 +202,7 @@ class MailerApp:
         self.profile_combo.configure(values=names)
         if hasattr(self, "_cloud_profile_combo"):
             self._cloud_profile_combo.configure(values=names)
+        self._refresh_cloud_batch_list(names)
         target = selected if selected is not None else store.get("active", "")
         if target in names:
             self.profile_var.set(target)
@@ -207,6 +210,20 @@ class MailerApp:
             self.profile_var.set(names[0])
         else:
             self.profile_var.set("")
+
+    def _refresh_cloud_batch_list(self, names: list[str] | None = None) -> None:
+        if not hasattr(self, "cloud_batch_list"):
+            return
+        if names is None:
+            store = self._read_profiles_store()
+            profiles = store.get("profiles", {})
+            names = sorted(profiles.keys()) if isinstance(profiles, dict) else []
+        current = set(self.cloud_batch_list.get(0, "end"))
+        if current == set(names):
+            return
+        self.cloud_batch_list.delete(0, "end")
+        for name in names:
+            self.cloud_batch_list.insert("end", name)
 
     def _save_profile_as(self) -> None:
         name = simpledialog.askstring("Сохранить профиль", "Название профиля:")
@@ -509,13 +526,26 @@ class MailerApp:
         dialog.title("SMTP аккаунты")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.geometry("980x300")
+        dialog.geometry("1080x340")
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill="both", expand=True)
-        headers = ["Вкл", "Название/домен", "Host", "Порт", "Логин", "Пароль", "From", "Лимит/день"]
+        ttk.Label(
+            frame,
+            text="Пул до 5 аккаунтов с авто-релеем: когда аккаунт упирается в свой дневной лимит, "
+                 "рассылка автоматически продолжается со следующего аккаунта с той же строки базы. "
+                 "Ставь разных провайдеров — бан одного не остановит остальные.",
+            wraplength=1040,
+        ).grid(row=0, column=0, columnspan=9, sticky="w", pady=(0, 8))
+        headers = ["Вкл", "Название/домен", "Host", "Порт", "Логин", "Пароль", "From", "Лимит/день", "Сегодня"]
         for col, title in enumerate(headers):
-            ttk.Label(frame, text=title).grid(row=0, column=col, sticky="w", padx=4)
+            ttk.Label(frame, text=title, style="TLabelframe.Label").grid(row=1, column=col, sticky="w", padx=4)
             frame.columnconfigure(col, weight=1 if col in (1, 2, 4, 5, 6) else 0)
+
+        state_data = self._load_state_json()
+        today = date.today().isoformat()
+        sent_map = state_data.get("account_sent_today", {}) if str(state_data.get("date", "")) == today else {}
+        if not isinstance(sent_map, dict):
+            sent_map = {}
 
         rows = []
         current = list(self.smtp_accounts)
@@ -532,17 +562,32 @@ class MailerApp:
             from_email = tk.StringVar(value=str(item.get("from_email", "")))
             daily_limit = tk.StringVar(value=str(item.get("daily_limit", self.limit_day_var.get().strip() or "2000")))
             values = [enabled, label, host, port, user, password, from_email, daily_limit]
-            ttk.Checkbutton(frame, variable=enabled).grid(row=idx + 1, column=0, padx=4, pady=4)
+            grid_row = idx + 2
+            ttk.Checkbutton(frame, variable=enabled).grid(row=grid_row, column=0, padx=4, pady=4)
             for col, var in enumerate(values[1:], start=1):
                 show = "*" if col == 5 else ""
                 entry = ttk.Entry(frame, textvariable=var, show=show, width=12)
-                entry.grid(row=idx + 1, column=col, sticky="ew", padx=4, pady=4)
+                entry.grid(row=grid_row, column=col, sticky="ew", padx=4, pady=4)
                 if col == 5:
                     self._add_paste_support(entry)
+            key = (user.get() or from_email.get() or label.get()).strip().lower()
+            sent_today = int(sent_map.get(key, 0)) if key else 0
+            limit_view = daily_limit.get().strip() or "2000"
+            ttk.Label(frame, text=f"{sent_today}/{limit_view}").grid(row=grid_row, column=8, sticky="w", padx=4)
             rows.append(values)
 
+        total_capacity = 0
+        for _e, _l, _h, _p, _u, _pw, _f, dl in rows:
+            if _e.get() and _u.get().strip() and _pw.get().strip():
+                total_capacity += self._safe_int(dl.get().strip(), 0)
+        ttk.Label(
+            frame,
+            text=f"Суммарная ёмкость активных аккаунтов: до {total_capacity} писем/сутки. "
+                 "«Сегодня» — сколько уже ушло с каждого (сбрасывается в полночь).",
+        ).grid(row=7, column=0, columnspan=9, sticky="w", pady=(8, 0))
+
         buttons = ttk.Frame(frame)
-        buttons.grid(row=6, column=0, columnspan=8, sticky="e", pady=(12, 0))
+        buttons.grid(row=8, column=0, columnspan=9, sticky="e", pady=(12, 0))
 
         def save() -> None:
             accounts = []
@@ -1141,6 +1186,48 @@ class MailerApp:
             text="При облачном режиме задача продолжает выполняться на сервере даже если GUI закрыт.",
         ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
+        batch = ttk.LabelFrame(frame, text="Параллельный запуск нескольких профилей", padding=8)
+        batch.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=(12, 0))
+        frame.rowconfigure(9, weight=1)
+        batch.columnconfigure(0, weight=1)
+        batch.columnconfigure(1, weight=2)
+        batch.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            batch,
+            text="Выбери профили (Cmd/Shift-клик) и запусти их в облаке одновременно — "
+                 "у каждого свой state, счётчик суток и SMTP-пул. Пароли должны быть сохранены в профиле.",
+            wraplength=900,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        list_wrap = ttk.Frame(batch)
+        list_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        list_wrap.rowconfigure(0, weight=1)
+        list_wrap.columnconfigure(0, weight=1)
+        self.cloud_batch_list = tk.Listbox(list_wrap, selectmode="extended", height=6, exportselection=False)
+        self.cloud_batch_list.grid(row=0, column=0, sticky="nsew")
+        list_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=self.cloud_batch_list.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self.cloud_batch_list.configure(yscrollcommand=list_scroll.set)
+
+        self.cloud_batch_tree = ttk.Treeview(
+            batch, columns=("profile", "status", "detail"), show="headings", height=6
+        )
+        self.cloud_batch_tree.heading("profile", text="Профиль")
+        self.cloud_batch_tree.heading("status", text="Статус")
+        self.cloud_batch_tree.heading("detail", text="Прогресс")
+        self.cloud_batch_tree.column("profile", width=140, anchor="w")
+        self.cloud_batch_tree.column("status", width=90, anchor="w")
+        self.cloud_batch_tree.column("detail", width=240, anchor="w")
+        self.cloud_batch_tree.grid(row=1, column=1, sticky="nsew")
+
+        batch_actions = ttk.Frame(batch)
+        batch_actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(batch_actions, text="▶ Запустить выбранные параллельно", command=self._start_cloud_batch).grid(row=0, column=0)
+        ttk.Button(batch_actions, text="⏹ Остановить все", command=self._stop_cloud_batch).grid(row=0, column=1, padx=(8, 0))
+
+        self._refresh_cloud_batch_list()
+
     def _build_server_config(self) -> ServerConfig:
         host = self.server_host_var.get().strip()
         username = self.server_user_var.get().strip()
@@ -1698,6 +1785,107 @@ class MailerApp:
             return ""
         return cmd[index + 1]
 
+    def _settings_to_command(self, s: dict, *, force_dry_run: bool, progress_file: str) -> list[str]:
+        """Собирает argv send_email.py из словаря настроек профиля (для параллельного облака).
+
+        Не читает живые поля UI — работает с сохранённым профилем, поэтому
+        несколько профилей можно запускать одновременно без гонки за self.*_var.
+        """
+        template = str(s.get("template", "")).strip()
+        if not template and bool(s.get("auto_template", True)):
+            guessed = self._guess_template_path()
+            if guessed is not None:
+                template = str(guessed)
+        if not template:
+            raise RuntimeError("нет HTML-шаблона в профиле")
+        to_file = str(s.get("to_file", "")).strip()
+        if not to_file:
+            raise RuntimeError("не указана база получателей в профиле")
+
+        raw_accounts = s.get("smtp_accounts", [])
+        active_accounts = [
+            a for a in raw_accounts
+            if isinstance(a, dict) and a.get("enabled", True)
+            and str(a.get("user", "")).strip() and str(a.get("password", "")).strip()
+        ] if isinstance(raw_accounts, list) else []
+        single_password = str(s.get("smtp_password", "")).strip()
+        if not active_accounts and not single_password:
+            raise RuntimeError("нет пароля SMTP (вкл. «Запомнить пароль» и пересохрани профиль)")
+
+        cmd = [
+            "python3", str(SCRIPT_PATH),
+            "--template", template,
+            "--smtp-host", str(s.get("smtp_host", "")).strip() or "smtp.timeweb.ru",
+            "--smtp-port", str(s.get("smtp_port", "")).strip() or "465",
+            "--smtp-user", str(s.get("smtp_user", "")).strip(),
+            "--smtp-password", single_password,
+            "--from-email", str(s.get("from_email", "")).strip() or str(s.get("smtp_user", "")).strip(),
+            "--xlsx-sheet", str(s.get("sheet", "")).strip() or "active",
+            "--xlsx-email-col", str(s.get("email_col", "")).strip() or "G",
+            "--xlsx-start-row", str(s.get("start_row", "")).strip() or "2",
+        ]
+        if bool(s.get("use_kind_template", False)):
+            cmd.extend(["--xlsx-kind-col", str(s.get("kind_col", "")).strip() or "P"])
+        kind_filter = str(s.get("kind_filter", "")).strip()
+        if kind_filter:
+            cmd.extend(["--xlsx-kind-filter", kind_filter])
+        hub_url = str(s.get("hub_url", "")).strip()
+        cid = str(s.get("hub_connection_id", "")).strip()
+        secret = str(s.get("hub_secret", "")).strip()
+        if hub_url and cid and secret:
+            cmd.extend(["--hub-url", hub_url, "--hub-connection-id", cid, "--hub-module-secret", secret])
+            if bool(s.get("hub_insecure_ssl", False)):
+                cmd.append("--hub-insecure-ssl")
+        if bool(s.get("allow_duplicate_emails", False)):
+            cmd.append("--allow-duplicate-emails")
+        subject = str(s.get("subject", "")).strip()
+        if subject:
+            cmd.extend(["--subject", subject])
+        fields = str(s.get("fields", "")).strip()
+        if fields:
+            cmd.extend(["--xlsx-fields", fields])
+        limit_min = str(s.get("limit_min", "")).strip()
+        if limit_min:
+            cmd.extend(["--limit-per-minute", limit_min])
+        limit_day = str(s.get("limit_day", "")).strip()
+        if limit_day:
+            cmd.extend(["--limit-per-day", limit_day])
+        cmd.extend(["--to-file", to_file])
+        state_file = str(s.get("state_file", "")).strip()
+        if state_file:
+            cmd.extend(["--state-file", state_file])
+
+        if active_accounts:
+            cleaned: list[str] = []
+            skip_next = False
+            single_flags = {"--smtp-host", "--smtp-port", "--smtp-user", "--smtp-password", "--from-email"}
+            for token in cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if token in single_flags:
+                    skip_next = True
+                    continue
+                cleaned.append(token)
+            cmd = cleaned
+            for account in active_accounts[:5]:
+                payload = {
+                    "label": str(account.get("label", "")).strip(),
+                    "host": str(account.get("host", "smtp.timeweb.ru")).strip() or "smtp.timeweb.ru",
+                    "port": int(self._safe_int(str(account.get("port", "465")), 465)),
+                    "user": str(account.get("user", "")).strip(),
+                    "password": str(account.get("password", "")).strip(),
+                    "from_email": str(account.get("from_email", "")).strip() or str(account.get("user", "")).strip(),
+                    "daily_limit": int(self._safe_int(str(account.get("daily_limit", "2000")), 2000)),
+                }
+                cmd.extend(["--smtp-account", json.dumps(payload, ensure_ascii=False)])
+
+        if progress_file:
+            cmd.extend(["--progress-file", progress_file])
+        if force_dry_run:
+            cmd.append("--dry-run")
+        return cmd
+
     def _collect_command(
         self,
         force_dry_run: bool | None = None,
@@ -1941,6 +2129,181 @@ class MailerApp:
                 self._set_status_async("Ошибка проверки статуса")
             finally:
                 pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- Параллельный запуск профилей в облаке ----------
+
+    def _cloud_batch_set(self, profile: str, status: str, detail: str) -> None:
+        def apply() -> None:
+            if not hasattr(self, "cloud_batch_tree"):
+                return
+            values = (profile, status, detail)
+            if self.cloud_batch_tree.exists(profile):
+                self.cloud_batch_tree.item(profile, values=values)
+            else:
+                self.cloud_batch_tree.insert("", "end", iid=profile, values=values)
+        self.root.after(0, apply)
+
+    def _start_cloud_batch(self) -> None:
+        if not hasattr(self, "cloud_batch_list"):
+            return
+        selected = [self.cloud_batch_list.get(i) for i in self.cloud_batch_list.curselection()]
+        if not selected:
+            messagebox.showinfo(
+                "Параллельный запуск",
+                "Выбери один или несколько профилей в списке (Cmd/Shift-клик для нескольких).",
+            )
+            return
+        try:
+            server_config = self._build_server_config()
+        except Exception as error:
+            messagebox.showerror("Облако", str(error))
+            return
+        already = {s["profile"] for s in self.cloud_sessions.values() if s.get("status") == "running"}
+        clash = [n for n in selected if n in already]
+        if clash:
+            messagebox.showwarning(
+                "Параллельный запуск",
+                "Эти профили уже выполняются в облаке: " + ", ".join(clash),
+            )
+            selected = [n for n in selected if n not in already]
+            if not selected:
+                return
+        self._append_log(f"\n[Cloud] Параллельный запуск {len(selected)} сессий: {', '.join(selected)}\n")
+        for name in selected:
+            self._cloud_batch_set(name, "ожидание", "постановка в очередь…")
+        threading.Thread(
+            target=self._run_cloud_batch_worker,
+            args=(selected, server_config),
+            daemon=True,
+        ).start()
+
+    def _run_cloud_batch_worker(self, profiles: list[str], server_config: ServerConfig) -> None:
+        store = self._read_profiles_store()
+        all_profiles = store.get("profiles", {})
+        try:
+            up_runtime = CloudRuntime(server_config, BASE_DIR)
+            up_runtime.connect()
+            self.log_queue.put("[Cloud] Загрузка файлов на сервер (один раз для всех сессий)...\n")
+            up_runtime.upload_project()
+            remote_base = up_runtime.get_remote_base_dir()
+            up_runtime.close()
+        except Exception as error:
+            self.log_queue.put(f"[Cloud] Ошибка загрузки на сервер: {error}\n")
+            for name in profiles:
+                self._cloud_batch_set(name, "ошибка", f"загрузка: {error}")
+            return
+
+        for name in profiles:
+            data = all_profiles.get(name)
+            if not isinstance(data, dict):
+                self._cloud_batch_set(name, "ошибка", "профиль не найден")
+                continue
+            data = self._ensure_profile_state_data(name, data)
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                safe = self._sanitize_filename_part(name)
+                progress_local = str((BASE_DIR / "logs" / f"cloud_{safe}_{timestamp}.progress.json"))
+                cmd = self._settings_to_command(data, force_dry_run=False, progress_file=progress_local)
+                remote_cmd = self._build_remote_command(cmd, remote_base)
+                runtime = CloudRuntime(server_config, BASE_DIR)
+                runtime.connect()
+                task = runtime.start_remote_process_detached(remote_cmd)
+                task["progress_file"] = self._extract_flag_value(remote_cmd, "--progress-file")
+                task["remote_state_file"] = self._extract_flag_value(remote_cmd, "--state-file")
+                task["local_state_file"] = self._extract_flag_value(cmd, "--state-file")
+                self.cloud_sessions[task["run_id"]] = {
+                    "profile": name,
+                    "runtime": runtime,
+                    "task": task,
+                    "log_offset": 0,
+                    "status": "running",
+                }
+                self._cloud_batch_set(name, "запущен", f"task {task['run_id']}")
+                self.log_queue.put(f"[Cloud:{name}] запущен на сервере (task {task['run_id']})\n")
+            except Exception as error:
+                self._cloud_batch_set(name, "ошибка", str(error))
+                self.log_queue.put(f"[Cloud:{name}] ошибка запуска: {error}\n")
+
+        self._ensure_cloud_monitor()
+
+    def _ensure_cloud_monitor(self) -> None:
+        if self._cloud_monitor_running:
+            return
+        self._cloud_monitor_running = True
+        threading.Thread(target=self._cloud_monitor_worker, daemon=True).start()
+
+    def _cloud_monitor_worker(self) -> None:
+        while True:
+            active = [
+                (rid, s) for rid, s in list(self.cloud_sessions.items())
+                if s.get("status") == "running"
+            ]
+            if not active:
+                self._cloud_monitor_running = False
+                return
+            for _rid, session in active:
+                runtime = session["runtime"]
+                task = session["task"]
+                name = session["profile"]
+                try:
+                    chunk, session["log_offset"] = runtime.read_log_chunk(task["log_file"], session["log_offset"])
+                    if chunk:
+                        for line in chunk.splitlines():
+                            self.log_queue.put(f"[Cloud:{name}] {line}\n")
+                    payload = self._read_remote_progress_payload(runtime, task.get("progress_file", ""))
+                    if payload:
+                        proc = payload.get("processed", 0)
+                        total = payload.get("total", 0)
+                        pct = payload.get("percent", 0)
+                        acc = str(payload.get("current_account", "")).strip()
+                        self._cloud_batch_set(name, "работает", f"{proc}/{total} ({pct}%) {acc}".strip())
+                    if not runtime.is_remote_process_running(task["pid_file"]):
+                        chunk, session["log_offset"] = runtime.read_log_chunk(task["log_file"], session["log_offset"])
+                        if chunk:
+                            for line in chunk.splitlines():
+                                self.log_queue.put(f"[Cloud:{name}] {line}\n")
+                        exit_code = runtime.read_exit_code(task["status_file"])
+                        remote_state = task.get("remote_state_file", "")
+                        local_state = task.get("local_state_file", "")
+                        if remote_state and local_state:
+                            try:
+                                local_path = Path(local_state).expanduser().resolve()
+                                if runtime.download_file(remote_state, local_path):
+                                    self.log_queue.put(f"[Cloud:{name}] state синхронизирован с сервера\n")
+                            except Exception as error:
+                                self.log_queue.put(f"[Cloud:{name}] state не скачан: {error}\n")
+                        session["status"] = "done"
+                        code_view = "готово" if exit_code in (0, None) else f"код {exit_code}"
+                        self._cloud_batch_set(name, "готово", code_view)
+                        self.log_queue.put(f"[Cloud:{name}] задача завершена ({code_view})\n")
+                        try:
+                            runtime.close()
+                        except Exception:
+                            pass
+                        self.root.after(0, self._refresh_state_info)
+                except Exception as error:
+                    self.log_queue.put(f"[Cloud:{name}] монитор: {error}\n")
+            time.sleep(1.5)
+
+    def _stop_cloud_batch(self) -> None:
+        running = [(rid, s) for rid, s in list(self.cloud_sessions.items()) if s.get("status") == "running"]
+        if not running:
+            messagebox.showinfo("Параллельный запуск", "Нет активных облачных сессий.")
+            return
+        if not messagebox.askyesno("Остановка", f"Остановить все облачные сессии ({len(running)})?"):
+            return
+
+        def worker() -> None:
+            for _rid, session in running:
+                name = session["profile"]
+                try:
+                    stopped, message = session["runtime"].stop_remote_process(session["task"]["run_id"])
+                    self.log_queue.put(f"[Cloud:{name}] остановка: {message}\n")
+                    self._cloud_batch_set(name, "остановка", message[:40])
+                except Exception as error:
+                    self.log_queue.put(f"[Cloud:{name}] ошибка остановки: {error}\n")
 
         threading.Thread(target=worker, daemon=True).start()
 
