@@ -297,6 +297,12 @@ class CloudRuntime:
                 return data.decode("utf-8", errors="replace")
             return str(data)
 
+    def upload_file(self, local_path: Path, remote_path: str) -> None:
+        """Заливает произвольный локальный файл на сервер (создаёт папки)."""
+        _, sftp = self._require_client()
+        self._remote_mkdirs(posixpath.dirname(remote_path))
+        sftp.put(str(local_path), remote_path)
+
     def download_file(self, remote_path: str, local_path: Path) -> bool:
         """Скачивает файл с сервера в local_path. True если файл существовал."""
         _, sftp = self._require_client()

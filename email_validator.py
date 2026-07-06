@@ -252,8 +252,12 @@ def main() -> None:
     ap.add_argument("--email-col", default="A", help="Колонка email в xlsx (по умолч. A)")
     ap.add_argument("--start-row", type=int, default=2, help="С какой строки читать xlsx (по умолч. 2)")
     ap.add_argument("--out", default="", help="Куда сохранить очищенный файл (необязательно)")
+    ap.add_argument("--txt-out", dest="txt_out", default="", help="Куда сохранить email через запятую (.txt)")
     ap.add_argument("--bad", default="", help="Куда выписать невалидные адреса (txt)")
     ap.add_argument("--report", default="", help="CSV-отчёт со статусом по каждому адресу")
+    ap.add_argument("--dedup", action="store_true", help="Удалять дубликаты email")
+    ap.add_argument("--skip-mx", dest="skip_mx", action="store_true",
+                    help="Не проверять MX/домен — только синтаксис и дубликаты (быстро, без интернета)")
     ap.add_argument("--workers", type=int, default=16)
     args = ap.parse_args()
 
@@ -271,18 +275,27 @@ def main() -> None:
         sys.exit("В файле нет адресов.")
 
     total = len(emails)
-    print(f"Загружено {total} адресов. Проверяю…", flush=True)
 
-    last_pct = -1
+    if args.skip_mx:
+        print(f"Загружено {total} адресов. Проверяю только синтаксис…", flush=True)
+        results = [
+            {"email": e, "ok": bool(EMAIL_RE.match((e or "").strip())),
+             "reason": "ok" if EMAIL_RE.match((e or "").strip()) else "bad_syntax"}
+            for e in emails
+        ]
+    else:
+        print(f"Загружено {total} адресов. Проверяю MX/синтаксис…", flush=True)
+        last_pct = -1
 
-    def progress(done: int, total: int, r: dict) -> None:
-        nonlocal last_pct
-        pct = int(done / total * 100)
-        if pct != last_pct and pct % 5 == 0:
-            print(f"  {done}/{total} ({pct}%)", flush=True)
-            last_pct = pct
+        def progress(done: int, total: int, r: dict) -> None:
+            nonlocal last_pct
+            pct = int(done / total * 100)
+            if pct != last_pct and pct % 5 == 0:
+                print(f"  {done}/{total} ({pct}%)", flush=True)
+                last_pct = pct
 
-    results = validate_emails(emails, workers=args.workers, on_progress=progress)
+        results = validate_emails(emails, workers=args.workers, on_progress=progress)
+
     bad = [r for r in results if not r["ok"]]
     ok = [r for r in results if r["ok"]]
     bad_set = {r["email"].strip() for r in bad}
@@ -293,6 +306,21 @@ def main() -> None:
         by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
     for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
         print(f"  {reason}: {count}")
+
+    def dedup_keep_order(items: list[str]) -> tuple[list[str], int]:
+        seen: set[str] = set()
+        kept: list[str] = []
+        removed = 0
+        for e in items:
+            key = e.strip().lower()
+            if not key:
+                continue
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            kept.append(e)
+        return kept, removed
 
     if args.bad:
         bad_path = Path(args.bad).expanduser().resolve()
@@ -310,14 +338,27 @@ def main() -> None:
                 w.writerow([r["email"], "1" if r["ok"] else "0", r["reason"]])
         print(f"Отчёт: {rep_path}")
 
+    ok_emails = [r["email"] for r in ok]
+    if args.dedup:
+        ok_emails, removed_dup = dedup_keep_order(ok_emails)
+        print(f"Удалено дубликатов: {removed_dup}")
+
+    if args.txt_out:
+        txt_path = Path(args.txt_out).expanduser().resolve()
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        txt_path.write_text(", ".join(ok_emails), encoding="utf-8")
+        print(f"TXT (через запятую): {txt_path} ({len(ok_emails)} адресов)")
+
     if args.out:
         out_path = Path(args.out).expanduser().resolve()
         if is_xlsx:
-            removed = _write_xlsx_cleaned(src, out_path, bad_set, args.email_col, args.start_row)
-            print(f"Очищенный xlsx: {out_path} (удалено строк: {removed})")
+            removed_bad, removed_dup = _write_xlsx_clean_dedup(
+                src, out_path, bad_set, args.dedup, args.email_col, args.start_row
+            )
+            print(f"Очищенный xlsx: {out_path} (удалено невалидных: {removed_bad}, дубликатов: {removed_dup})")
         else:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text("\n".join(r["email"] for r in ok), encoding="utf-8")
+            out_path.write_text("\n".join(ok_emails), encoding="utf-8")
             print(f"Очищенный файл: {out_path}")
 
 

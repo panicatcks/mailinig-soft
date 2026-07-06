@@ -910,10 +910,14 @@ class MailerApp:
         actions.grid(row=5, column=0, columnspan=3, sticky="w", pady=(14, 0))
         self.validate_dedup_btn = ttk.Button(actions, text="⚡ Убрать дубликаты (быстро)", command=self._start_dedup_only)
         self.validate_dedup_btn.grid(row=0, column=0)
+        self.validate_txt_btn = ttk.Button(actions, text="📄 Дубли → .txt (через запятую)", command=self._export_txt_dedup)
+        self.validate_txt_btn.grid(row=0, column=1, padx=(8, 0))
         self.validate_start_btn = ttk.Button(actions, text="🩺 Проверить почту + очистить", command=self._start_validation)
-        self.validate_start_btn.grid(row=0, column=1, padx=(8, 0))
+        self.validate_start_btn.grid(row=0, column=2, padx=(8, 0))
         self.validate_stop_btn = ttk.Button(actions, text="Стоп", command=self._stop_validation, state="disabled")
-        self.validate_stop_btn.grid(row=0, column=2, padx=(8, 0))
+        self.validate_stop_btn.grid(row=0, column=3, padx=(8, 0))
+        self.validate_cloud_btn = ttk.Button(actions, text="☁ Очистить на облаке (MX+дубли)", command=self._start_cloud_clean)
+        self.validate_cloud_btn.grid(row=1, column=0, pady=(8, 0), sticky="w")
 
         self.validate_progress_var = tk.StringVar(value="Готов к проверке.")
         ttk.Label(
@@ -1169,6 +1173,184 @@ class MailerApp:
                 self.root.after(0, lambda e=exc: self._finish_validation(f"Ошибка: {e}", None))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _export_txt_dedup(self) -> None:
+        """Оффлайн-экспорт: из базы (xlsx/txt) в .txt с email через запятую, без дублей."""
+        import threading
+        src_raw = self.to_file_var.get().strip()
+        if not src_raw:
+            messagebox.showwarning("Экспорт в .txt", "Сначала выбери файл базы.")
+            return
+        src = Path(src_raw).expanduser().resolve()
+        if not src.exists():
+            messagebox.showerror("Экспорт в .txt", f"Файл не найден: {src}")
+            return
+        col = (self.email_col_var.get() or "A").strip()
+        try:
+            start_row = int(self.validate_start_row_var.get() or "2")
+        except ValueError:
+            start_row = 2
+        out_path = filedialog.asksaveasfilename(
+            title="Сохранить email через запятую как…",
+            defaultextension=".txt",
+            initialfile=f"{src.stem}_email.txt",
+            filetypes=[("Текст", "*.txt"), ("Все файлы", "*.*")],
+        )
+        if not out_path:
+            return
+        out = Path(out_path).expanduser()
+
+        self.validate_log.configure(state="normal")
+        self.validate_log.delete("1.0", "end")
+        self.validate_log.configure(state="disabled")
+        self.validate_progress_var.set("Готовлю .txt…")
+        self.validate_txt_btn.configure(state="disabled")
+        self.validate_dedup_btn.configure(state="disabled")
+
+        def worker() -> None:
+            import email_validator as ev
+            try:
+                if src.suffix.lower() in {".xlsx", ".xlsm"}:
+                    emails, _ = ev._read_xlsx_emails(src, col, start_row)
+                else:
+                    emails = ev._read_text_emails(src)
+                seen: set[str] = set()
+                kept: list[str] = []
+                removed = 0
+                for e in emails:
+                    key = e.strip().lower()
+                    if not key:
+                        continue
+                    if key in seen:
+                        removed += 1
+                        continue
+                    seen.add(key)
+                    kept.append(e.strip())
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(", ".join(kept), encoding="utf-8")
+                summary = (
+                    f"\nГотово. Уникальных адресов: {len(kept)} (убрано дублей: {removed})\n"
+                    f"Файл: {out}"
+                )
+                self.root.after(0, lambda: self._finish_txt_export(
+                    f"Готово. {len(kept)} адресов в .txt (дублей убрано {removed}).", summary))
+            except BaseException as exc:  # noqa: BLE001
+                self.root.after(0, lambda e=exc: self._finish_txt_export(f"Ошибка: {e}", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_txt_export(self, status_text: str, summary: str | None) -> None:
+        self.validate_progress_var.set(status_text)
+        if summary:
+            self._validate_log_append(summary)
+        self.validate_txt_btn.configure(state="normal")
+        self.validate_dedup_btn.configure(state="normal")
+
+    def _start_cloud_clean(self) -> None:
+        """Гоняет чистку базы (MX + дубликаты) на облачном сервере и качает результаты."""
+        import threading
+        src_raw = self.to_file_var.get().strip()
+        if not src_raw:
+            messagebox.showwarning("Очистка на облаке", "Сначала выбери файл базы.")
+            return
+        src = Path(src_raw).expanduser().resolve()
+        if not src.exists():
+            messagebox.showerror("Очистка на облаке", f"Файл не найден: {src}")
+            return
+        try:
+            server_config = self._build_server_config()
+        except Exception as error:
+            messagebox.showerror("Очистка на облаке", str(error))
+            return
+        col = (self.email_col_var.get() or "A").strip()
+        try:
+            start_row = int(self.validate_start_row_var.get() or "2")
+        except ValueError:
+            start_row = 2
+        dedup = bool(self.validate_dedup_var.get())
+
+        self.validate_progress_var.set("Отправляю базу на сервер…")
+        self.validate_cloud_btn.configure(state="disabled")
+        self._append_log(f"\n[Cloud-clean] Старт облачной очистки: {src.name}\n")
+
+        def worker() -> None:
+            runtime = CloudRuntime(server_config, BASE_DIR)
+            try:
+                runtime.connect()
+                self.log_queue.put("[Cloud-clean] Загрузка кода на сервер...\n")
+                runtime.upload_project()
+                remote_base = runtime.get_remote_base_dir().rstrip("/")
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                job_dir = f"{remote_base}/.clean_jobs/{stamp}"
+                remote_in = f"{job_dir}/{src.name}"
+                self.log_queue.put("[Cloud-clean] Заливаю базу на сервер...\n")
+                runtime.upload_file(src, remote_in)
+                out_ext = src.suffix if src.suffix.lower() in {".xlsx", ".xlsm"} else ".txt"
+                remote_out = f"{job_dir}/{src.stem}_очищенный{out_ext}"
+                remote_bad = f"{job_dir}/{src.stem}_невалидные.txt"
+                remote_report = f"{job_dir}/{src.stem}_отчёт.csv"
+                remote_txt = f"{job_dir}/{src.stem}_email.txt"
+                argv = [
+                    "python3", f"{remote_base}/email_validator.py",
+                    "--in", remote_in,
+                    "--email-col", col,
+                    "--start-row", str(start_row),
+                    "--out", remote_out,
+                    "--bad", remote_bad,
+                    "--report", remote_report,
+                    "--txt-out", remote_txt,
+                ]
+                if dedup:
+                    argv.append("--dedup")
+                self.log_queue.put("[Cloud-clean] Запуск проверки на сервере (detached)...\n")
+                task = runtime.start_remote_process_detached(argv)
+                self.root.after(0, lambda: self.validate_progress_var.set("Проверка идёт на сервере…"))
+                log_offset = 0
+                while True:
+                    chunk, log_offset = runtime.read_log_chunk(task["log_file"], log_offset)
+                    if chunk:
+                        for line in chunk.splitlines():
+                            self.log_queue.put(f"[Cloud-clean] {line}\n")
+                    if not runtime.is_remote_process_running(task["pid_file"]):
+                        chunk, log_offset = runtime.read_log_chunk(task["log_file"], log_offset)
+                        if chunk:
+                            for line in chunk.splitlines():
+                                self.log_queue.put(f"[Cloud-clean] {line}\n")
+                        break
+                    time.sleep(1.0)
+                exit_code = runtime.read_exit_code(task["status_file"])
+                self.root.after(0, lambda: self.validate_progress_var.set("Скачиваю результаты с сервера…"))
+                downloaded = []
+                for remote_path in (remote_out, remote_bad, remote_report, remote_txt):
+                    local_dest = src.with_name(Path(remote_path).name)
+                    try:
+                        if runtime.download_file(remote_path, local_dest):
+                            downloaded.append(str(local_dest))
+                            self.log_queue.put(f"[Cloud-clean] Скачан: {local_dest}\n")
+                    except Exception as error:
+                        self.log_queue.put(f"[Cloud-clean] Не скачан {Path(remote_path).name}: {error}\n")
+                code_view = "ok" if exit_code in (0, None) else f"код {exit_code}"
+                files_txt = "\n".join(f"  • {p}" for p in downloaded) or "  (файлы не скачаны)"
+                summary = (
+                    f"\nОблачная очистка завершена ({code_view}). Скачано в папку базы:\n{files_txt}"
+                )
+                self.root.after(0, lambda: self._finish_cloud_clean(
+                    f"Облако: готово ({code_view}), файлов скачано {len(downloaded)}.", summary))
+            except Exception as error:
+                self.root.after(0, lambda e=error: self._finish_cloud_clean(f"Ошибка облака: {e}", None))
+            finally:
+                try:
+                    runtime.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_cloud_clean(self, status_text: str, summary: str | None) -> None:
+        self.validate_progress_var.set(status_text)
+        if summary:
+            self._validate_log_append(summary)
+        self.validate_cloud_btn.configure(state="normal")
 
     def _build_hub_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
