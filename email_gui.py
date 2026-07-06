@@ -869,13 +869,14 @@ class MailerApp:
 
     def _build_validate_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(6, weight=1)
+        frame.rowconfigure(7, weight=1)
 
         ttk.Label(
             frame,
-            text="Проверка базы: каждый адрес проверяется на синтаксис и наличие MX/A-записи у домена. "
-                 "Невалидные удаляются — Timeweb перестаёт банить за рассылку «в никуда».",
-            wraplength=720,
+            text="Чистка базы. «Убрать дубликаты» — мгновенно, без интернета (по всей книге). "
+                 "«Проверить почту» — дополнительно проверяет синтаксис и MX-запись домена "
+                 "(медленно, для больших баз не нужно).",
+            wraplength=760,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
         ttk.Label(frame, text="Файл базы:").grid(row=1, column=0, sticky="w", padx=(0, 8))
@@ -885,9 +886,11 @@ class MailerApp:
         ttk.Label(frame, text="Колонка email:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         row2 = ttk.Frame(frame)
         row2.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        self.validate_start_row_var = tk.StringVar(value="2")
         ttk.Entry(row2, textvariable=self.email_col_var, width=8).grid(row=0, column=0)
-        ttk.Label(row2, text="   Начать со строки:").grid(row=0, column=1, padx=(8, 4))
-        ttk.Entry(row2, textvariable=self.start_row_var, width=6).grid(row=0, column=2)
+        ttk.Label(row2, text="   Данные со строки:").grid(row=0, column=1, padx=(8, 4))
+        ttk.Entry(row2, textvariable=self.validate_start_row_var, width=6).grid(row=0, column=2)
+        ttk.Label(row2, text="(обычно 2 — чистится вся база, не с позиции докрутки)").grid(row=0, column=3, padx=(8, 0))
 
         self.validate_dedup_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -896,21 +899,30 @@ class MailerApp:
             variable=self.validate_dedup_var,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+        self.validate_overwrite_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text="Заменить исходный файл (создаётся копия .bak) — тогда рассылка сразу пойдёт по чистой базе",
+            variable=self.validate_overwrite_var,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         actions = ttk.Frame(frame)
-        actions.grid(row=4, column=0, columnspan=3, sticky="w", pady=(14, 0))
-        self.validate_start_btn = ttk.Button(actions, text="🩺 Проверить базу", command=self._start_validation)
-        self.validate_start_btn.grid(row=0, column=0)
+        actions.grid(row=5, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        self.validate_dedup_btn = ttk.Button(actions, text="⚡ Убрать дубликаты (быстро)", command=self._start_dedup_only)
+        self.validate_dedup_btn.grid(row=0, column=0)
+        self.validate_start_btn = ttk.Button(actions, text="🩺 Проверить почту + очистить", command=self._start_validation)
+        self.validate_start_btn.grid(row=0, column=1, padx=(8, 0))
         self.validate_stop_btn = ttk.Button(actions, text="Стоп", command=self._stop_validation, state="disabled")
-        self.validate_stop_btn.grid(row=0, column=1, padx=(8, 0))
+        self.validate_stop_btn.grid(row=0, column=2, padx=(8, 0))
 
         self.validate_progress_var = tk.StringVar(value="Готов к проверке.")
         ttk.Label(
             frame, textvariable=self.validate_progress_var, style="Header.TLabel"
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 4))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 4))
 
         from tkinter.scrolledtext import ScrolledText
         self.validate_log = ScrolledText(frame, height=14, wrap="word")
-        self.validate_log.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        self.validate_log.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
         self.validate_log.configure(state="disabled")
 
         self._validate_cancel = None
@@ -936,15 +948,17 @@ class MailerApp:
             return
         col = (self.email_col_var.get() or "A").strip()
         try:
-            start_row = int(self.start_row_var.get() or "2")
+            start_row = int(self.validate_start_row_var.get() or "2")
         except ValueError:
             start_row = 2
+        overwrite = bool(self.validate_overwrite_var.get())
 
         self.validate_log.configure(state="normal")
         self.validate_log.delete("1.0", "end")
         self.validate_log.configure(state="disabled")
         self.validate_progress_var.set("Загружаю адреса…")
         self.validate_start_btn.configure(state="disabled")
+        self.validate_dedup_btn.configure(state="disabled")
         self.validate_stop_btn.configure(state="normal")
 
         dedup = bool(self.validate_dedup_var.get())
@@ -1049,11 +1063,12 @@ class MailerApp:
                 reason_lines = "\n".join(f"  {k}: {v}" for k, v in sorted(by_reason.items(), key=lambda x: -x[1]))
                 dup_line = f"Удалено дубликатов: {removed_dup}\n" if dedup else ""
 
+                final_file, extra = self._finalize_cleaned(src, cleaned, overwrite)
                 summary = (
                     f"\nГотово. Валидных: {len(ok_results)}, удалено невалидных: {removed_bad}\n"
                     f"{dup_line}"
                     f"{reason_lines}\n\n"
-                    f"Очищенный файл: {cleaned}\n"
+                    f"{extra}"
                     f"Список невалидных: {bad_path}\n"
                     f"Отчёт: {report_path}"
                 )
@@ -1079,7 +1094,81 @@ class MailerApp:
         if summary:
             self._validate_log_append(summary)
         self.validate_start_btn.configure(state="normal")
+        self.validate_dedup_btn.configure(state="normal")
         self.validate_stop_btn.configure(state="disabled")
+
+    def _finalize_cleaned(self, src: Path, cleaned: Path, overwrite: bool) -> tuple[Path, str]:
+        """Если overwrite — заменяет исходник очищенным (с бэкапом .bak). Возвращает (итоговый_файл, текст)."""
+        if not overwrite:
+            return cleaned, f"Очищенный файл: {cleaned}\n"
+        backup = src.with_name(f"{src.stem}.bak{src.suffix}")
+        try:
+            import shutil
+            shutil.copy2(src, backup)
+            cleaned.replace(src)
+            return src, (
+                f"Исходный файл заменён очищенной базой: {src}\n"
+                f"Резервная копия оригинала: {backup}\n"
+            )
+        except Exception as error:
+            return cleaned, (
+                f"Очищенный файл: {cleaned}\n"
+                f"(не удалось заменить оригинал: {error})\n"
+            )
+
+    def _start_dedup_only(self) -> None:
+        """Быстрое удаление дубликатов без проверки почты (без интернета)."""
+        import threading
+        src_raw = self.to_file_var.get().strip()
+        if not src_raw:
+            messagebox.showwarning("Дубликаты", "Сначала выбери файл базы.")
+            return
+        src = Path(src_raw).expanduser().resolve()
+        if not src.exists():
+            messagebox.showerror("Дубликаты", f"Файл не найден: {src}")
+            return
+        col = (self.email_col_var.get() or "A").strip()
+        try:
+            start_row = int(self.validate_start_row_var.get() or "2")
+        except ValueError:
+            start_row = 2
+        overwrite = bool(self.validate_overwrite_var.get())
+
+        self.validate_log.configure(state="normal")
+        self.validate_log.delete("1.0", "end")
+        self.validate_log.configure(state="disabled")
+        self.validate_progress_var.set("Убираю дубликаты…")
+        self.validate_start_btn.configure(state="disabled")
+        self.validate_dedup_btn.configure(state="disabled")
+
+        def worker() -> None:
+            import email_validator as ev
+            try:
+                is_xlsx = src.suffix.lower() in {".xlsx", ".xlsm"}
+                cleaned = src.with_name(f"{src.stem}_очищенный{src.suffix}")
+                if is_xlsx:
+                    _, removed_dup = ev._write_xlsx_clean_dedup(src, cleaned, set(), True, col, start_row)
+                else:
+                    emails = ev._read_text_emails(src)
+                    seen: set[str] = set()
+                    kept: list[str] = []
+                    removed_dup = 0
+                    for e in emails:
+                        key = e.strip().lower()
+                        if key in seen:
+                            removed_dup += 1
+                            continue
+                        seen.add(key)
+                        kept.append(e)
+                    cleaned.write_text("\n".join(kept), encoding="utf-8")
+                final_file, extra = self._finalize_cleaned(src, cleaned, overwrite)
+                summary = f"\nУдалено дубликатов: {removed_dup}\n{extra}"
+                self.root.after(0, lambda: self._finish_validation(
+                    f"Готово. Удалено дубликатов: {removed_dup}.", summary))
+            except BaseException as exc:  # noqa: BLE001
+                self.root.after(0, lambda e=exc: self._finish_validation(f"Ошибка: {e}", None))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_hub_controls(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
