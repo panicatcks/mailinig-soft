@@ -1045,7 +1045,7 @@ class MailerApp:
 
                 removed_dup = 0
                 if is_xlsx:
-                    removed_bad, removed_dup = ev._write_xlsx_clean_dedup(
+                    removed_bad, removed_dup, _removed = ev._write_xlsx_clean_dedup(
                         src, cleaned, bad_set, dedup, col, start_row
                     )
                 else:
@@ -1121,7 +1121,11 @@ class MailerApp:
             )
 
     def _start_dedup_only(self) -> None:
-        """Быстрое удаление дубликатов без проверки почты (без интернета)."""
+        """Быстрое удаление дубликатов и синтаксически неправильных адресов (без интернета).
+
+        Спрашивает: куда сохранить очищенную базу и куда выгрузить удалённые
+        (дубли + неправильные). Мультилист: чистятся все листы книги.
+        """
         import threading
         src_raw = self.to_file_var.get().strip()
         if not src_raw:
@@ -1136,39 +1140,92 @@ class MailerApp:
             start_row = int(self.validate_start_row_var.get() or "2")
         except ValueError:
             start_row = 2
-        overwrite = bool(self.validate_overwrite_var.get())
+
+        is_xlsx = src.suffix.lower() in {".xlsx", ".xlsm"}
+        out_ext = src.suffix if is_xlsx else ".txt"
+        clean_type = [("Excel", "*.xlsx"), ("Все файлы", "*.*")] if is_xlsx else [("Текст", "*.txt"), ("Все файлы", "*.*")]
+        cleaned_raw = filedialog.asksaveasfilename(
+            title="Сохранить очищенную базу как…",
+            defaultextension=out_ext,
+            initialfile=f"{src.stem}_очищенный{out_ext}",
+            filetypes=clean_type,
+        )
+        if not cleaned_raw:
+            return
+        cleaned = Path(cleaned_raw).expanduser()
+        if not cleaned.suffix:
+            cleaned = cleaned.with_suffix(out_ext)
+        removed_raw = filedialog.asksaveasfilename(
+            title="Куда сохранить удалённые (дубли + неправильные)… (можно пропустить)",
+            defaultextension=".txt",
+            initialfile=f"{src.stem}_удалённые.txt",
+            filetypes=[("Текст", "*.txt"), ("Все файлы", "*.*")],
+        )
+        removed_path = None
+        if removed_raw:
+            removed_path = Path(removed_raw).expanduser()
+            if not removed_path.suffix:
+                removed_path = removed_path.with_suffix(".txt")
 
         self.validate_log.configure(state="normal")
         self.validate_log.delete("1.0", "end")
         self.validate_log.configure(state="disabled")
-        self.validate_progress_var.set("Убираю дубликаты…")
+        self.validate_progress_var.set("Убираю дубликаты и неправильные…")
         self.validate_start_btn.configure(state="disabled")
         self.validate_dedup_btn.configure(state="disabled")
 
         def worker() -> None:
             import email_validator as ev
+            from email_validator import EMAIL_RE
             try:
-                is_xlsx = src.suffix.lower() in {".xlsx", ".xlsm"}
-                cleaned = src.with_name(f"{src.stem}_очищенный{src.suffix}")
                 if is_xlsx:
-                    _, removed_dup = ev._write_xlsx_clean_dedup(src, cleaned, set(), True, col, start_row)
+                    removed_bad, removed_dup, removed = ev._write_xlsx_clean_dedup(
+                        src, cleaned, set(), True, col, start_row, drop_bad_syntax=True
+                    )
+                    kept_n = -1  # для xlsx точное число оставшихся не считаем построчно
                 else:
                     emails = ev._read_text_emails(src)
                     seen: set[str] = set()
                     kept: list[str] = []
+                    removed = []
+                    removed_bad = 0
                     removed_dup = 0
-                    for e in emails:
-                        key = e.strip().lower()
+                    for raw in emails:
+                        e = raw.strip()
+                        key = e.lower()
+                        if not key:
+                            continue
+                        if not EMAIL_RE.match(e):
+                            removed.append(e)
+                            removed_bad += 1
+                            continue
                         if key in seen:
+                            removed.append(e)
                             removed_dup += 1
                             continue
                         seen.add(key)
                         kept.append(e)
+                    cleaned.parent.mkdir(parents=True, exist_ok=True)
                     cleaned.write_text("\n".join(kept), encoding="utf-8")
-                final_file, extra = self._finalize_cleaned(src, cleaned, overwrite)
-                summary = f"\nУдалено дубликатов: {removed_dup}\n{extra}"
+                    kept_n = len(kept)
+
+                if removed_path is not None:
+                    removed_path.parent.mkdir(parents=True, exist_ok=True)
+                    removed_path.write_text("\n".join(removed), encoding="utf-8")
+
+                removed_line = (
+                    f"Файл удалённых: {removed_path}\n" if removed_path is not None else ""
+                )
+                kept_line = f"Осталось адресов: {kept_n}\n" if kept_n >= 0 else ""
+                summary = (
+                    f"\nГотово.\n{kept_line}"
+                    f"Удалено неправильных: {removed_bad}, дубликатов: {removed_dup}\n"
+                    f"Очищенная база: {cleaned}\n"
+                    f"{removed_line}"
+                )
                 self.root.after(0, lambda: self._finish_validation(
-                    f"Готово. Удалено дубликатов: {removed_dup}.", summary))
+                    f"Готово. Убрано неправильных {removed_bad}, дублей {removed_dup}.",
+                    summary))
             except BaseException as exc:  # noqa: BLE001
                 self.root.after(0, lambda e=exc: self._finish_validation(f"Ошибка: {e}", None))
 

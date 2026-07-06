@@ -204,11 +204,14 @@ def _write_xlsx_clean_dedup(
     dedup: bool,
     email_col: str,
     start_row: int = 2,
-) -> tuple[int, int]:
+    drop_bad_syntax: bool = False,
+) -> tuple[int, int, list[str]]:
     """Чистит xlsx: удаляет невалидные и (опц.) повторные адреса по всем листам.
 
     Дубликаты считаются глобально по всей книге (первое вхождение остаётся).
-    Возвращает (удалено_невалидных, удалено_дубликатов).
+    drop_bad_syntax: дополнительно удалять ячейки без корректного email-синтаксиса
+    (в т.ч. значения без «@» — их не видит _read_xlsx_emails).
+    Возвращает (удалено_невалидных, удалено_дубликатов, список_удалённых_значений).
     """
     try:
         from openpyxl import load_workbook
@@ -218,6 +221,7 @@ def _write_xlsx_clean_dedup(
     col_idx = _col_to_index(email_col)
     removed_bad = 0
     removed_dup = 0
+    removed_values: list[str] = []
     seen: set[str] = set()
     for ws in wb.worksheets:
         rows_to_delete: list[int] = []
@@ -229,21 +233,23 @@ def _write_xlsx_clean_dedup(
             if not email:
                 continue
             key = email.lower()
-            if email in bad_set:
+            if email in bad_set or (drop_bad_syntax and not EMAIL_RE.match(email)):
                 rows_to_delete.append(r)
                 removed_bad += 1
+                removed_values.append(email)
                 continue
             if dedup:
                 if key in seen:
                     rows_to_delete.append(r)
                     removed_dup += 1
+                    removed_values.append(email)
                     continue
                 seen.add(key)
         for r in reversed(rows_to_delete):
             ws.delete_rows(r, 1)
     dest.parent.mkdir(parents=True, exist_ok=True)
     wb.save(dest)
-    return removed_bad, removed_dup
+    return removed_bad, removed_dup, removed_values
 
 
 def main() -> None:
@@ -352,7 +358,7 @@ def main() -> None:
     if args.out:
         out_path = Path(args.out).expanduser().resolve()
         if is_xlsx:
-            removed_bad, removed_dup = _write_xlsx_clean_dedup(
+            removed_bad, removed_dup, _removed = _write_xlsx_clean_dedup(
                 src, out_path, bad_set, args.dedup, args.email_col, args.start_row
             )
             print(f"Очищенный xlsx: {out_path} (удалено невалидных: {removed_bad}, дубликатов: {removed_dup})")
