@@ -341,6 +341,8 @@ class MailerApp:
             self.server_port_var,
             self.server_user_var,
             self.server_password_var,
+            self.server_key_path_var,
+            self.server_key_pass_var,
             self.server_remote_dir_var,
             self.dry_run_var,
             self.test_email_var,
@@ -1454,6 +1456,8 @@ class MailerApp:
         self.server_port_var = tk.StringVar(value="22")
         self.server_user_var = tk.StringVar()
         self.server_password_var = tk.StringVar()
+        self.server_key_path_var = tk.StringVar()
+        self.server_key_pass_var = tk.StringVar()
         self.server_remote_dir_var = tk.StringVar(value="~/mailinig-soft-cloud")
         self.cloud_status_var = tk.StringVar(value="Сервер не инициализирован")
         self.update_status_var = tk.StringVar(value="Обновления не проверялись")
@@ -1476,11 +1480,29 @@ class MailerApp:
         server_pass_entry.grid(row=2, column=3, sticky="ew", pady=(8, 0))
         self._add_paste_support(server_pass_entry)
 
-        ttk.Label(frame, text="Папка на сервере:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(frame, textvariable=self.server_remote_dir_var).grid(row=3, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        key_frame = ttk.Frame(frame)
+        key_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        key_frame.columnconfigure(1, weight=1)
+        ttk.Label(key_frame, text="SSH ключ (вместо пароля):").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        key_entry = ttk.Entry(key_frame, textvariable=self.server_key_path_var)
+        key_entry.grid(row=0, column=1, sticky="ew")
+        self._add_paste_support(key_entry)
+        ttk.Button(key_frame, text="Выбрать ключ", command=self._pick_ssh_key).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(key_frame, text="Очистить", command=lambda: self.server_key_path_var.set("")).grid(row=0, column=3, padx=(6, 0))
+        ttk.Label(key_frame, text="Пароль ключа:").grid(row=0, column=4, sticky="w", padx=(12, 8))
+        key_pass_entry = ttk.Entry(key_frame, textvariable=self.server_key_pass_var, show="*", width=16)
+        key_pass_entry.grid(row=0, column=5, sticky="w")
+        self._add_paste_support(key_pass_entry)
+        ttk.Label(
+            key_frame,
+            text="Если сервер пускает только по ключу — укажи файл ключа (id_rsa / .pem). Пароль можно оставить пустым.",
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+        ttk.Label(frame, text="Папка на сервере:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.server_remote_dir_var).grid(row=4, column=1, columnspan=3, sticky="ew", pady=(8, 0))
 
         run_frame = ttk.LabelFrame(frame, text="Запуск профиля в облаке", padding=8)
-        run_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        run_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         run_frame.columnconfigure(1, weight=1)
         ttk.Label(run_frame, text="Профиль:").grid(row=0, column=0, sticky="w", padx=(0, 8))
         cloud_profile_combo = ttk.Combobox(
@@ -1499,24 +1521,24 @@ class MailerApp:
         ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
         actions = ttk.Frame(frame)
-        actions.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        actions.grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Button(actions, text="Инициализация сервера", command=self._initialize_server).grid(row=0, column=0)
         ttk.Button(actions, text="Проверить обновления", command=self._check_for_updates).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(actions, text="Обновить программу", command=self._apply_update).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(actions, text="Статус облачной задачи", command=self._check_cloud_task_status).grid(row=0, column=3, padx=(8, 0))
 
-        ttk.Label(frame, text="Статус облака:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
-        ttk.Label(frame, textvariable=self.cloud_status_var).grid(row=6, column=1, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Label(frame, text="Статус обновлений:").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Label(frame, textvariable=self.update_status_var).grid(row=7, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="Статус облака:").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        ttk.Label(frame, textvariable=self.cloud_status_var).grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(frame, text="Статус обновлений:").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Label(frame, textvariable=self.update_status_var).grid(row=8, column=1, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(
             frame,
             text="При облачном режиме задача продолжает выполняться на сервере даже если GUI закрыт.",
-        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         batch = ttk.LabelFrame(frame, text="Параллельный запуск нескольких профилей", padding=8)
-        batch.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=(12, 0))
-        frame.rowconfigure(9, weight=1)
+        batch.grid(row=10, column=0, columnspan=4, sticky="nsew", pady=(12, 0))
+        frame.rowconfigure(10, weight=1)
         batch.columnconfigure(0, weight=1)
         batch.columnconfigure(1, weight=2)
         batch.rowconfigure(1, weight=1)
@@ -1556,14 +1578,28 @@ class MailerApp:
 
         self._refresh_cloud_batch_list()
 
+    def _pick_ssh_key(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Выберите файл SSH-ключа",
+            filetypes=[("SSH ключи", "*.pem *.key id_rsa id_ed25519 *.ppk"), ("Все файлы", "*.*")],
+        )
+        if path:
+            self.server_key_path_var.set(path)
+
     def _build_server_config(self) -> ServerConfig:
         host = self.server_host_var.get().strip()
         username = self.server_user_var.get().strip()
         password = self.server_password_var.get().strip()
+        key_path = self.server_key_path_var.get().strip()
+        key_passphrase = self.server_key_pass_var.get().strip()
         remote_dir = self.server_remote_dir_var.get().strip() or "~/mailinig-soft-cloud"
         port = self._safe_int(self.server_port_var.get().strip(), 22)
-        if not host or not username or not password:
-            raise RuntimeError("Заполните IP/домен, SSH логин и SSH пароль.")
+        if not host or not username:
+            raise RuntimeError("Заполните IP/домен и SSH логин.")
+        if not password and not key_path:
+            raise RuntimeError("Укажите SSH пароль или файл SSH-ключа.")
+        if key_path and not Path(key_path).expanduser().exists():
+            raise RuntimeError(f"Файл ключа не найден: {key_path}")
         if port <= 0:
             raise RuntimeError("SSH порт должен быть положительным числом.")
         return ServerConfig(
@@ -1572,6 +1608,8 @@ class MailerApp:
             username=username,
             password=password,
             remote_dir=remote_dir,
+            key_path=key_path,
+            key_passphrase=key_passphrase,
         )
 
     def _initialize_server(self) -> None:
@@ -2905,6 +2943,8 @@ class MailerApp:
             "server_port": self.server_port_var.get().strip(),
             "server_user": self.server_user_var.get().strip(),
             "server_password": self.server_password_var.get().strip(),
+            "server_key_path": self.server_key_path_var.get().strip(),
+            "server_key_passphrase": self.server_key_pass_var.get().strip(),
             "server_remote_dir": self.server_remote_dir_var.get().strip(),
             "dry_run": self.dry_run_var.get(),
             "test_email": self.test_email_var.get().strip(),
@@ -2954,6 +2994,8 @@ class MailerApp:
             self.server_port_var.set(data.get("server_port", "22"))
             self.server_user_var.set(data.get("server_user", ""))
             self.server_password_var.set(data.get("server_password", ""))
+            self.server_key_path_var.set(data.get("server_key_path", ""))
+            self.server_key_pass_var.set(data.get("server_key_passphrase", ""))
             self.server_remote_dir_var.set(data.get("server_remote_dir", "~/mailinig-soft-cloud"))
             last_task = data.get("cloud_last_task", {})
             self.remote_task_meta = last_task if isinstance(last_task, dict) and last_task else None

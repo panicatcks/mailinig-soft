@@ -43,6 +43,8 @@ class ServerConfig:
     username: str
     password: str
     remote_dir: str
+    key_path: str = ""
+    key_passphrase: str = ""
 
 
 class CloudRuntimeError(RuntimeError):
@@ -85,15 +87,32 @@ class CloudRuntime:
             return
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=self.config.host,
-            port=self.config.port,
-            username=self.config.username,
-            password=self.config.password,
-            timeout=20,
-            banner_timeout=20,
-            auth_timeout=20,
-        )
+        connect_kwargs: dict = {
+            "hostname": self.config.host,
+            "port": self.config.port,
+            "username": self.config.username,
+            "timeout": 20,
+            "banner_timeout": 20,
+            "auth_timeout": 20,
+        }
+        key_path = (self.config.key_path or "").strip()
+        password = self.config.password or ""
+        if key_path:
+            expanded = str(Path(key_path).expanduser())
+            connect_kwargs["key_filename"] = expanded
+            passphrase = (self.config.key_passphrase or "").strip() or password.strip()
+            if passphrase:
+                connect_kwargs["passphrase"] = passphrase
+            # ключ задан — не мешаем автоподбору ключей из агента/~/.ssh
+            connect_kwargs["look_for_keys"] = True
+            connect_kwargs["allow_agent"] = True
+            if password:
+                connect_kwargs["password"] = password
+        else:
+            connect_kwargs["password"] = password
+            connect_kwargs["look_for_keys"] = True
+            connect_kwargs["allow_agent"] = True
+        client.connect(**connect_kwargs)
         self.client = client
         self.sftp = client.open_sftp()
         self.remote_home = self.sftp.normalize(".")
