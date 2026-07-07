@@ -85,15 +85,15 @@ class CloudRuntime:
     def connect(self) -> None:
         if self.client is not None:
             return
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         connect_kwargs: dict = {
             "hostname": self.config.host,
             "port": self.config.port,
             "username": self.config.username,
-            "timeout": 20,
-            "banner_timeout": 20,
-            "auth_timeout": 20,
+            # РФ→зарубежный сервер: баннер SSH может приходить с задержкой (DPI/троттлинг),
+            # поэтому таймауты щедрые, плюс ниже — ретраи.
+            "timeout": 30,
+            "banner_timeout": 60,
+            "auth_timeout": 45,
         }
         key_path = (self.config.key_path or "").strip()
         password = self.config.password or ""
@@ -112,10 +112,37 @@ class CloudRuntime:
             connect_kwargs["password"] = password
             connect_kwargs["look_for_keys"] = True
             connect_kwargs["allow_agent"] = True
-        client.connect(**connect_kwargs)
-        self.client = client
-        self.sftp = client.open_sftp()
-        self.remote_home = self.sftp.normalize(".")
+
+        last_error: Exception | None = None
+        for attempt in range(3):
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                client.connect(**connect_kwargs)
+                self.client = client
+                self.sftp = client.open_sftp()
+                self.remote_home = self.sftp.normalize(".")
+                return
+            except paramiko.AuthenticationException:
+                # неверные логин/ключ/пароль — ретраи не помогут
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                raise
+            except Exception as error:  # banner/timeout/сеть — пробуем ещё раз
+                last_error = error
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(2 + attempt * 2)
+        raise CloudRuntimeError(
+            "Не удалось подключиться к серверу по SSH после 3 попыток: "
+            f"{last_error}. Проверьте IP/порт, доступность сервера и что вход разрешён "
+            "(ключ или пароль). Если сервер за границей — возможен троттлинг сети."
+        )
 
     def close(self) -> None:
         if self.sftp is not None:

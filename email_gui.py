@@ -1447,7 +1447,41 @@ class MailerApp:
             text="Пиксель откртия письма работает только если заполнены все три поля.",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-    def _build_cloud_controls(self, frame: ttk.Frame) -> None:
+    def _make_scrollable(self, parent: ttk.Frame) -> ttk.Frame:
+        """Оборачивает содержимое в вертикально прокручиваемую область.
+
+        Нужно вкладке «Облако» — иначе нижние блоки (параллельный запуск)
+        не влезают в окно и кнопки уходят за край.
+        """
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _on_inner_configure(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event) -> None:
+            canvas.itemconfigure(window, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_wheel(event) -> None:
+            delta = event.delta
+            if delta == 0:
+                return
+            canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+
+        inner.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+        inner.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return inner
+
+    def _build_cloud_controls(self, outer_frame: ttk.Frame) -> None:
+        frame = self._make_scrollable(outer_frame)
         for idx in range(4):
             frame.columnconfigure(idx, weight=1 if idx in (1, 3) else 0)
 
