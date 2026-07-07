@@ -114,7 +114,38 @@ def get_local_commit(base_dir: Path) -> str:
     return result.stdout.strip()
 
 
+GIT_REMOTE_URL = "https://github.com/panicatcks/mailinig-soft.git"
+
+
+def fetch_remote_commit_via_git() -> str:
+    """Достаёт удалённый SHA через `git ls-remote` (ходит на github.com, а не api.github.com).
+
+    В РФ api.github.com часто заблокирован, а github.com — доступен, поэтому
+    это надёжнее API. Возвращает '' если git недоступен или команда упала.
+    """
+    if not git_available():
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", GIT_REMOTE_URL, "main"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=25,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0 or not result.stdout.strip():
+        return ""
+    sha = result.stdout.strip().split()[0].strip()
+    return sha[:12] if sha else ""
+
+
 def fetch_remote_commit() -> str:
+    # Сначала пробуем git ls-remote (github.com) — он работает там, где api.github.com режется.
+    via_git = fetch_remote_commit_via_git()
+    if via_git:
+        return via_git
     req = Request(API_COMMITS_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "mailinig-soft-updater"})
     try:
         with _urlopen_with_tls_fallback(req, timeout=20) as response:
@@ -195,7 +226,13 @@ def update_with_archive(base_dir: Path) -> str:
             target = base_dir / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-    return fetch_remote_commit()
+    # Файлы уже применены. Узнать точный SHA приятно, но если сеть к API/ls-remote
+    # недоступна — не роняем апдейт: берём версию из свежераспакованного APP_VERSION.
+    try:
+        return fetch_remote_commit()
+    except Exception:
+        version = _read_app_version(base_dir)
+        return f"build-{version}" if version else "archive-update"
 
 
 def apply_update(base_dir: Path) -> str:
