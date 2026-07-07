@@ -1579,9 +1579,14 @@ class MailerApp:
         self._refresh_cloud_batch_list()
 
     def _pick_ssh_key(self) -> None:
+        # Ключи часто без расширения (id_rsa, EU) — фильтр по расширению их прячет,
+        # поэтому показываем все файлы. По умолчанию открываем ~/.ssh.
+        ssh_dir = Path("~/.ssh").expanduser()
+        initial_dir = str(ssh_dir) if ssh_dir.exists() else str(Path.home())
         path = filedialog.askopenfilename(
-            title="Выберите файл SSH-ключа",
-            filetypes=[("SSH ключи", "*.pem *.key id_rsa id_ed25519 *.ppk"), ("Все файлы", "*.*")],
+            title="Выберите файл SSH-ключа (например ~/.ssh/EU, без .pub)",
+            initialdir=initial_dir,
+            filetypes=[("Все файлы", "*")],
         )
         if path:
             self.server_key_path_var.set(path)
