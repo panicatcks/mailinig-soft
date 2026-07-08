@@ -2430,13 +2430,81 @@ class MailerApp:
                 mask_next = True
         return " ".join(safe)
 
-    def _build_remote_command(self, cmd: list[str], remote_base_dir: str) -> list[str]:
+    def _build_remote_command(
+        self,
+        cmd: list[str],
+        remote_base_dir: str,
+        runtime: "CloudRuntime | None" = None,
+        uploaded_cache: set[str] | None = None,
+    ) -> list[str]:
+        """Переводит локальную argv в argv для сервера.
+
+        Файлы внутри проекта → относительный путь на сервере. Файлы ВНЕ проекта
+        (например HTML-шаблон и база на Рабочем столе) заливаются в `.external/`
+        на сервере и путь подменяется — иначе на сервере FileNotFoundError.
+        """
         remote_cmd: list[str] = []
         remote_base = remote_base_dir.rstrip("/")
-        path_flags = {"--template", "--to-file", "--state-file", "--progress-file"}
+        # Входные файлы (нужно залить, если они снаружи проекта):
+        input_flags = {"--template", "--to-file"}
+        # Файлы состояния — заливаем, если уже есть (чтобы дневные лимиты не сбрасывались):
+        state_flags = {"--state-file"}
+        # Выходные файлы — только подменяем путь, сервер создаст сам:
+        output_flags = {"--progress-file"}
+        path_flags = input_flags | state_flags | output_flags
         previous_flag = ""
+        if uploaded_cache is None:
+            uploaded_cache = set()
 
-        def map_local_path(raw: str) -> str:
+        def external_remote_path(resolved: Path) -> str:
+            digest = hashlib.md5(str(resolved).encode("utf-8", "replace")).hexdigest()[:8]
+            safe_name = self._sanitize_filename_part(resolved.name) or "file"
+            return f"{remote_base}/.external/{digest}_{safe_name}"
+
+        def upload_external_template(resolved: Path) -> str:
+            """Заливает внешний HTML-шаблон + его inline-картинки в отдельную папку.
+
+            send_email.py ищет `<img src="...">` относительно папки шаблона, поэтому
+            картинки надо положить рядом с шаблоном на сервере с тем же относительным
+            путём — иначе письма уйдут с «битыми» картинками.
+            """
+            dir_digest = hashlib.md5(
+                str(resolved.parent).encode("utf-8", "replace")
+            ).hexdigest()[:8]
+            remote_dir = f"{remote_base}/.external/tpl_{dir_digest}"
+            safe_name = self._sanitize_filename_part(resolved.name) or "template.html"
+            remote_template = f"{remote_dir}/{safe_name}"
+            if runtime is None:
+                return remote_template
+            if remote_template not in uploaded_cache:
+                runtime.upload_file(resolved, remote_template)
+                uploaded_cache.add(remote_template)
+                try:
+                    html = resolved.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    html = ""
+                for match in re.finditer(
+                    r'<img[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
+                ):
+                    src = match.group(1).strip()
+                    if src.lower().startswith(("http://", "https://", "cid:", "data:", "/")):
+                        continue
+                    img_local = (resolved.parent / src).resolve()
+                    if not (img_local.exists() and img_local.is_file()):
+                        continue
+                    img_remote = f"{remote_dir}/{src.lstrip('./')}"
+                    if img_remote in uploaded_cache:
+                        continue
+                    try:
+                        runtime.upload_file(img_local, img_remote)
+                        uploaded_cache.add(img_remote)
+                    except Exception as error:  # pragma: no cover - зависит от сети
+                        self.log_queue.put(
+                            f"[Cloud] Не удалось залить картинку {src}: {error}\n"
+                        )
+            return remote_template
+
+        def map_local_path(raw: str, flag: str) -> str:
             path = Path(raw).expanduser()
             resolved = path.resolve()
             if resolved == SCRIPT_PATH:
@@ -2444,7 +2512,25 @@ class MailerApp:
             if resolved.is_relative_to(BASE_DIR):
                 relative = resolved.relative_to(BASE_DIR).as_posix()
                 return f"{remote_base}/{relative}"
-            return raw
+            # Путь снаружи проекта — подменяем на .external/ и при необходимости заливаем.
+            if flag == "--template":
+                if runtime is not None and not resolved.exists():
+                    raise RuntimeError(f"файл не найден локально: {resolved}")
+                return upload_external_template(resolved)
+            remote_path = external_remote_path(resolved)
+            should_upload = (flag in input_flags) or (flag in state_flags and resolved.exists())
+            if should_upload and runtime is not None and remote_path not in uploaded_cache:
+                if resolved.exists():
+                    try:
+                        runtime.upload_file(resolved, remote_path)
+                        uploaded_cache.add(remote_path)
+                    except Exception as error:  # pragma: no cover - зависит от сети
+                        self.log_queue.put(
+                            f"[Cloud] Не удалось залить файл {resolved.name}: {error}\n"
+                        )
+                elif flag in input_flags:
+                    raise RuntimeError(f"файл не найден локально: {resolved}")
+            return remote_path
 
         for index, token in enumerate(cmd):
             if index == 0 and token == "python3":
@@ -2452,7 +2538,7 @@ class MailerApp:
                 previous_flag = ""
                 continue
             if index == 1:
-                remote_cmd.append(map_local_path(token))
+                remote_cmd.append(map_local_path(token, ""))
                 previous_flag = ""
                 continue
             if token.startswith("--"):
@@ -2460,7 +2546,7 @@ class MailerApp:
                 previous_flag = token
                 continue
             if previous_flag in path_flags:
-                remote_cmd.append(map_local_path(token))
+                remote_cmd.append(map_local_path(token, previous_flag))
             else:
                 remote_cmd.append(token)
             previous_flag = ""
@@ -2593,13 +2679,17 @@ class MailerApp:
             self.log_queue.put("[Cloud] Загрузка файлов на сервер (один раз для всех сессий)...\n")
             up_runtime.upload_project()
             remote_base = up_runtime.get_remote_base_dir()
-            up_runtime.close()
         except Exception as error:
             self.log_queue.put(f"[Cloud] Ошибка загрузки на сервер: {error}\n")
             for name in profiles:
                 self._cloud_batch_set(name, "ошибка", f"загрузка: {error}")
+            try:
+                up_runtime.close()
+            except Exception:
+                pass
             return
 
+        uploaded_external: set[str] = set()
         for name in profiles:
             data = all_profiles.get(name)
             if not isinstance(data, dict):
@@ -2611,7 +2701,9 @@ class MailerApp:
                 safe = self._sanitize_filename_part(name)
                 progress_local = str((BASE_DIR / "logs" / f"cloud_{safe}_{timestamp}.progress.json"))
                 cmd = self._settings_to_command(data, force_dry_run=False, progress_file=progress_local)
-                remote_cmd = self._build_remote_command(cmd, remote_base)
+                remote_cmd = self._build_remote_command(
+                    cmd, remote_base, runtime=up_runtime, uploaded_cache=uploaded_external
+                )
                 runtime = CloudRuntime(server_config, BASE_DIR)
                 runtime.connect()
                 task = runtime.start_remote_process_detached(remote_cmd)
@@ -2631,6 +2723,10 @@ class MailerApp:
                 self._cloud_batch_set(name, "ошибка", str(error))
                 self.log_queue.put(f"[Cloud:{name}] ошибка запуска: {error}\n")
 
+        try:
+            up_runtime.close()
+        except Exception:
+            pass
         self._ensure_cloud_monitor()
 
     def _ensure_cloud_monitor(self) -> None:
@@ -2858,7 +2954,9 @@ class MailerApp:
                     runtime = self._ensure_cloud_runtime()
                     self.log_queue.put("[Cloud] Синхронизация файлов проекта...\n")
                     runtime.upload_project()
-                    remote_cmd = self._build_remote_command(cmd, runtime.get_remote_base_dir())
+                    remote_cmd = self._build_remote_command(
+                        cmd, runtime.get_remote_base_dir(), runtime=runtime
+                    )
                     self.log_queue.put("[Cloud] Запуск задачи на сервере (detached)...\n")
                     task = runtime.start_remote_process_detached(remote_cmd)
                     progress_file = self._extract_flag_value(remote_cmd, "--progress-file")
