@@ -3165,9 +3165,189 @@ class MailerApp:
             self._apply_settings_data(data)
 
 
+def _play_sound_async(args: list[str]) -> None:
+    """Проигрывает системный звук/голос в фоне (только macOS). Тихо падает, если нельзя."""
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+class IntroSplash:
+    """Весёлая заставка при запуске: летающие языки 👅 и влетающие надписи со звуком."""
+
+    PHRASES = [
+        ("Сергеейй…", "#ffffff", 46, "Milena"),
+        ("HATEEED…", "#ff3b30", 60, "Daniel"),
+        ("VPN…", "#00e5ff", 54, "Daniel"),
+        ("Рассылки…", "#34c759", 46, "Milena"),
+        ("Умный доооом…", "#ffd60a", 46, "Milena"),
+        ("Налоговая, где деньги?! ⁉️", "#ff2d55", 40, "Milena"),
+    ]
+    WHOOSH = [
+        "/System/Library/Sounds/Pop.aiff",
+        "/System/Library/Sounds/Tink.aiff",
+        "/System/Library/Sounds/Blow.aiff",
+        "/System/Library/Sounds/Submarine.aiff",
+        "/System/Library/Sounds/Frog.aiff",
+        "/System/Library/Sounds/Sosumi.aiff",
+    ]
+
+    def __init__(self, root: tk.Tk, on_done) -> None:
+        import random
+
+        self.root = root
+        self.on_done = on_done
+        self.random = random
+        self.done = False
+
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg="#0a0a14")
+        w, h = 740, 480
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 3
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.w, self.h = w, h
+
+        self.canvas = tk.Canvas(
+            self.win, width=w, height=h, bg="#0a0a14", highlightthickness=0
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        # Летающие языки на фоне
+        self.tongues: list[dict] = []
+        for _ in range(12):
+            item = self.canvas.create_text(
+                self.random.randint(40, w - 40),
+                self.random.randint(40, h - 40),
+                text=self.random.choice(["👅", "👅", "😜", "🤪", "👅"]),
+                font=("Helvetica", self.random.randint(22, 40)),
+            )
+            self.tongues.append({
+                "id": item,
+                "dx": self.random.choice([-1, 1]) * self.random.uniform(2.0, 5.0),
+                "dy": self.random.choice([-1, 1]) * self.random.uniform(2.0, 5.0),
+            })
+
+        # Пропуск по клику / Escape
+        self.win.bind("<Button-1>", lambda _e: self._finish())
+        self.win.bind("<Escape>", lambda _e: self._finish())
+        self.win.focus_set()
+
+        # Страховка: что бы ни случилось — окно уйдёт максимум через 12 сек
+        self.root.after(12000, self._finish)
+
+        self._animate_tongues()
+        self.phrase_slots: list[int] = []
+        self.root.after(300, lambda: self._show_phrase(0))
+
+    def _animate_tongues(self) -> None:
+        if self.done:
+            return
+        for t in self.tongues:
+            self.canvas.move(t["id"], t["dx"], t["dy"])
+            x, y = self.canvas.coords(t["id"])
+            if x < 20 or x > self.w - 20:
+                t["dx"] = -t["dx"]
+            if y < 20 or y > self.h - 20:
+                t["dy"] = -t["dy"]
+        try:
+            self.root.after(30, self._animate_tongues)
+        except Exception:
+            pass
+
+    def _show_phrase(self, index: int) -> None:
+        if self.done:
+            return
+        if index >= len(self.PHRASES):
+            self.root.after(1300, self._finish)
+            return
+        text, color, size, voice = self.PHRASES[index]
+        target_y = 90 + index * 62
+        from_left = index % 2 == 0
+        start_x = -300 if from_left else self.w + 300
+        item = self.canvas.create_text(
+            start_x, target_y, text=text, fill=color,
+            font=("Helvetica", size, "bold"),
+        )
+        # Звук: свист + голос
+        _play_sound_async(["afplay", self.WHOOSH[index % len(self.WHOOSH)]])
+        _play_sound_async(["say", "-v", voice, "-r", "210", text.replace("…", "").replace("⁉️", "")])
+
+        target_x = self.w // 2
+        step = (target_x - start_x) / 12.0
+
+        def fly(frame: int) -> None:
+            if self.done:
+                return
+            if frame >= 12:
+                self.canvas.coords(item, target_x, target_y)
+                # маленький «удар» — последняя фраза трясётся
+                if index == len(self.PHRASES) - 1:
+                    self._shake(item, target_x, target_y, 0)
+                self.root.after(520, lambda: self._show_phrase(index + 1))
+                return
+            self.canvas.move(item, step, 0)
+            self.root.after(18, lambda: fly(frame + 1))
+
+        fly(0)
+
+    def _shake(self, item: int, cx: int, cy: int, n: int) -> None:
+        if self.done or n >= 10:
+            if not self.done:
+                self.canvas.coords(item, cx, cy)
+            return
+        dx = self.random.randint(-8, 8)
+        dy = self.random.randint(-4, 4)
+        self.canvas.coords(item, cx + dx, cy + dy)
+        self.root.after(45, lambda: self._shake(item, cx, cy, n + 1))
+
+    def _finish(self) -> None:
+        if self.done:
+            return
+        self.done = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        try:
+            self.on_done()
+        except Exception:
+            pass
+
+
 def main() -> None:
     root = tk.Tk()
-    MailerApp(root)
+    root.withdraw()
+
+    def build_app() -> None:
+        MailerApp(root)
+        root.deiconify()
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
+
+    try:
+        IntroSplash(root, build_app)
+    except Exception:
+        # Если заставка не заведётся — просто открываем приложение.
+        build_app()
     root.mainloop()
 
 
