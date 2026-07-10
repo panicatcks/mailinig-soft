@@ -577,7 +577,7 @@ def analyze_workbook(to_file: str) -> dict:
     ext = path.suffix.lower()
     if ext in {".csv", ".txt"}:
         content = path.read_text(encoding="utf-8", errors="ignore")
-        emails = {m.lower() for m in send_email.EMAIL_RE.findall(content)}
+        emails = {m.lower() for m in send_email.extract_emails(content)}
         if not emails:
             return {"ok": False, "message": "В файле не нашлось ни одного email."}
         return {"ok": True, "email_col": "A", "start_row": 1, "total": len(emails),
@@ -604,7 +604,7 @@ def analyze_workbook(to_file: str) -> dict:
             for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=5000, values_only=True), start=1):
                 for col_idx, value in enumerate(row, start=1):
                     text = send_email.to_str(value)
-                    if text and send_email.EMAIL_RE.fullmatch(text):
+                    if text and send_email.EMAIL_RE.fullmatch(text) and send_email.is_valid_email_syntax(text):
                         col_hits[col_idx] = col_hits.get(col_idx, 0) + 1
                         if col_idx not in col_first_row:
                             col_first_row[col_idx] = row_idx
@@ -813,7 +813,10 @@ class ValidatorJob:
             bad_path = src.with_name(f"{stem}_невалидные.txt")
             report_path = src.with_name(f"{stem}_отчёт.csv")
 
-            bad_path.write_text("\n".join(r["email"] for r in bad), encoding="utf-8")
+            bad_path.write_text(
+                "\n".join(str(r["email"]).strip() or "<empty>" for r in bad),
+                encoding="utf-8",
+            )
             import csv as _csv
             with report_path.open("w", encoding="utf-8", newline="") as f:
                 w = _csv.writer(f)

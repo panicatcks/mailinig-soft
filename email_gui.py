@@ -1029,6 +1029,9 @@ class MailerApp:
 
                 bad = [r for r in results if r and not r["ok"]]
                 ok_results = [r for r in results if r and r["ok"]]
+                unverified_n = sum(
+                    1 for r in ok_results if not r.get("verified", True)
+                )
                 bad_set = {r["email"].strip() for r in bad}
 
                 stem = src.stem
@@ -1037,7 +1040,10 @@ class MailerApp:
                 report_path = src.with_name(f"{stem}_отчёт.csv")
 
                 status("Записываю очищенный файл…")
-                bad_path.write_text("\n".join(r["email"] for r in bad), encoding="utf-8")
+                bad_path.write_text(
+                    "\n".join(str(r["email"]).strip() or "<empty>" for r in bad),
+                    encoding="utf-8",
+                )
                 with report_path.open("w", encoding="utf-8", newline="") as f:
                     w = _csv.writer(f)
                     w.writerow(["email", "ok", "reason"])
@@ -1048,7 +1054,7 @@ class MailerApp:
                 removed_dup = 0
                 if is_xlsx:
                     removed_bad, removed_dup, _removed = ev._write_xlsx_clean_dedup(
-                        src, cleaned, bad_set, dedup, col, start_row
+                        src, cleaned, bad_set, dedup, col, start_row, drop_bad_syntax=True
                     )
                 else:
                     seen = set()
@@ -1072,11 +1078,12 @@ class MailerApp:
                 final_file, extra = self._finalize_cleaned(src, cleaned, overwrite)
                 summary = (
                     f"\nГотово. Валидных: {len(ok_results)}, удалено невалидных: {removed_bad}\n"
-                    f"{dup_line}"
-                    f"{reason_lines}\n\n"
-                    f"{extra}"
-                    f"Список невалидных: {bad_path}\n"
-                    f"Отчёт: {report_path}"
+                    + (f"DNS не удалось проверить: {unverified_n} (не удалены)\n" if unverified_n else "")
+                    + f"{dup_line}"
+                    + f"{reason_lines}\n\n"
+                    + f"{extra}"
+                    + f"Список невалидных: {bad_path}\n"
+                    + f"Отчёт: {report_path}"
                 )
                 final_status = (
                     f"Готово. Валидных {len(ok_results)}, "
@@ -1178,7 +1185,7 @@ class MailerApp:
 
         def worker() -> None:
             import email_validator as ev
-            from email_validator import EMAIL_RE
+            from email_validator import is_valid_email_syntax
             try:
                 if is_xlsx:
                     removed_bad, removed_dup, removed = ev._write_xlsx_clean_dedup(
@@ -1197,7 +1204,7 @@ class MailerApp:
                         key = e.lower()
                         if not key:
                             continue
-                        if not EMAIL_RE.match(e):
+                        if not is_valid_email_syntax(e):
                             removed.append(e)
                             removed_bad += 1
                             continue
@@ -1279,6 +1286,9 @@ class MailerApp:
                 for e in emails:
                     key = e.strip().lower()
                     if not key:
+                        continue
+                    if not ev.is_valid_email_syntax(e):
+                        removed += 1
                         continue
                     if key in seen:
                         removed += 1
@@ -1388,7 +1398,9 @@ class MailerApp:
                             self.log_queue.put(f"[Cloud-clean] Скачан: {local_dest}\n")
                     except Exception as error:
                         self.log_queue.put(f"[Cloud-clean] Не скачан {Path(remote_path).name}: {error}\n")
-                code_view = "ok" if exit_code in (0, None) else f"код {exit_code}"
+                code_view = "ok" if exit_code == 0 else (
+                    "статус неизвестен" if exit_code is None else f"код {exit_code}"
+                )
                 files_txt = "\n".join(f"  • {p}" for p in downloaded) or "  (файлы не скачаны)"
                 summary = (
                     f"\nОблачная очистка завершена ({code_view}). Скачано в папку базы:\n{files_txt}"
@@ -1950,7 +1962,9 @@ class MailerApp:
     def _save_state_json(self, data: dict) -> None:
         path = self._get_state_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
 
     def _reset_campaign_state(self) -> None:
         campaign_key = self._build_campaign_key_for_ui()
@@ -1961,7 +1975,11 @@ class MailerApp:
         if not isinstance(campaigns, dict):
             campaigns = {}
             data["campaigns"] = campaigns
-        campaigns[campaign_key] = {"cursor_index": 0, "last_row": 0}
+        campaigns[campaign_key] = {
+            "cursor_index": 0,
+            "last_row": 0,
+            "override_at": datetime.now().isoformat(timespec="microseconds"),
+        }
         if "date" not in data:
             data["date"] = date.today().isoformat()
         if "sent_today" not in data:
@@ -1984,7 +2002,11 @@ class MailerApp:
         if not isinstance(campaigns, dict):
             campaigns = {}
             data["campaigns"] = campaigns
-        campaigns[campaign_key] = {"cursor_index": 0, "last_row": max(row - 1, 0)}
+        campaigns[campaign_key] = {
+            "cursor_index": 0,
+            "last_row": max(row - 1, 0),
+            "override_at": datetime.now().isoformat(timespec="microseconds"),
+        }
         if "date" not in data:
             data["date"] = date.today().isoformat()
         if "sent_today" not in data:
@@ -1999,6 +2021,8 @@ class MailerApp:
             data = {}
         data["date"] = date.today().isoformat()
         data["sent_today"] = 0
+        data["account_sent_today"] = {}
+        data["daily_override_at"] = datetime.now().isoformat(timespec="microseconds")
         if "campaigns" not in data or not isinstance(data.get("campaigns"), dict):
             data["campaigns"] = {}
         self._save_state_json(data)
@@ -2162,7 +2186,7 @@ class MailerApp:
             return
         try:
             local_path = Path(local_state).expanduser().resolve()
-            pulled = runtime.download_file(remote_state, local_path)
+            pulled = runtime.pull_state_file(remote_state, local_path)
             if pulled:
                 self.log_queue.put(f"[Cloud] State синхронизирован с сервера → {local_path}\n")
                 self.root.after(0, self._refresh_state_info)
@@ -2189,6 +2213,25 @@ class MailerApp:
         if index + 1 >= len(cmd):
             return ""
         return cmd[index + 1]
+
+    def _campaign_key_from_command(self, cmd: list[str]) -> str:
+        """Build the same key as send_email.py, before local paths are remapped."""
+        to_file = self._extract_flag_value(cmd, "--to-file")
+        template = self._extract_flag_value(cmd, "--template")
+        raw = "|".join(
+            [
+                str(Path(to_file).expanduser().resolve()) if to_file else "",
+                self._extract_flag_value(cmd, "--xlsx-sheet") or "active",
+                self._extract_flag_value(cmd, "--xlsx-email-col") or "A",
+                self._extract_flag_value(cmd, "--xlsx-kind-col"),
+                self._extract_flag_value(cmd, "--xlsx-kind-filter") or "ALL",
+                self._extract_flag_value(cmd, "--xlsx-start-row") or "2",
+                self._extract_flag_value(cmd, "--xlsx-fields"),
+                str("--allow-duplicate-emails" in cmd),
+                str(Path(template).expanduser().resolve()) if template else str(Path("").resolve()),
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     def _settings_to_command(self, s: dict, *, force_dry_run: bool, progress_file: str) -> list[str]:
         """Собирает argv send_email.py из словаря настроек профиля (для параллельного облака).
@@ -2443,6 +2486,9 @@ class MailerApp:
         (например HTML-шаблон и база на Рабочем столе) заливаются в `.external/`
         на сервере и путь подменяется — иначе на сервере FileNotFoundError.
         """
+        source_cmd = list(cmd)
+        if "--campaign-key" not in source_cmd:
+            source_cmd.extend(["--campaign-key", self._campaign_key_from_command(source_cmd)])
         remote_cmd: list[str] = []
         remote_base = remote_base_dir.rstrip("/")
         # Входные файлы (нужно залить, если они снаружи проекта):
@@ -2511,13 +2557,23 @@ class MailerApp:
                 return f"{remote_base}/send_email.py"
             if resolved.is_relative_to(BASE_DIR):
                 relative = resolved.relative_to(BASE_DIR).as_posix()
-                return f"{remote_base}/{relative}"
+                remote_path = f"{remote_base}/{relative}"
+                if flag in state_flags and runtime is not None:
+                    synced = runtime.sync_state_file(resolved, remote_path)
+                    message = "объединён и загружен" if synced else "ещё не создан"
+                    self.log_queue.put(f"[Cloud] State перед запуском: {message} ({resolved})\n")
+                return remote_path
             # Путь снаружи проекта — подменяем на .external/ и при необходимости заливаем.
             if flag == "--template":
                 if runtime is not None and not resolved.exists():
                     raise RuntimeError(f"файл не найден локально: {resolved}")
                 return upload_external_template(resolved)
             remote_path = external_remote_path(resolved)
+            if flag in state_flags and runtime is not None:
+                synced = runtime.sync_state_file(resolved, remote_path)
+                message = "объединён и загружен" if synced else "ещё не создан"
+                self.log_queue.put(f"[Cloud] State перед запуском: {message} ({resolved})\n")
+                return remote_path
             should_upload = (flag in input_flags) or (flag in state_flags and resolved.exists())
             if should_upload and runtime is not None and remote_path not in uploaded_cache:
                 if resolved.exists():
@@ -2532,7 +2588,7 @@ class MailerApp:
                     raise RuntimeError(f"файл не найден локально: {resolved}")
             return remote_path
 
-        for index, token in enumerate(cmd):
+        for index, token in enumerate(source_cmd):
             if index == 0 and token == "python3":
                 remote_cmd.append("python3")
                 previous_flag = ""
@@ -2550,10 +2606,28 @@ class MailerApp:
             else:
                 remote_cmd.append(token)
             previous_flag = ""
+
+        if runtime is not None:
+            local_state = self._extract_flag_value(source_cmd, "--state-file")
+            remote_state = self._extract_flag_value(remote_cmd, "--state-file")
+            stable_key = self._extract_flag_value(source_cmd, "--campaign-key")
+            legacy_key = self._campaign_key_from_command(remote_cmd)
+            if local_state and remote_state and stable_key and legacy_key != stable_key:
+                migrated = runtime.migrate_campaign_key(
+                    Path(local_state).expanduser().resolve(),
+                    remote_state,
+                    stable_key,
+                    legacy_key,
+                )
+                if migrated:
+                    self.log_queue.put(
+                        "[Cloud] Старый облачный прогресс перенесён на стабильный ключ кампании.\n"
+                    )
         return remote_cmd
 
     def _ensure_cloud_runtime(self) -> CloudRuntime:
         if self.cloud_runtime is not None:
+            self.cloud_runtime.connect()
             return self.cloud_runtime
         runtime = CloudRuntime(self._build_server_config(), BASE_DIR)
         runtime.connect()
@@ -2604,7 +2678,7 @@ class MailerApp:
                     if remote_state and local_state:
                         try:
                             local_path = Path(local_state).expanduser().resolve()
-                            if runtime.download_file(remote_state, local_path):
+                            if runtime.pull_state_file(remote_state, local_path):
                                 self.log_queue.put(
                                     f"[Cloud] State синхронизирован с сервера → {local_path}\n"
                                 )
@@ -2771,13 +2845,17 @@ class MailerApp:
                         if remote_state and local_state:
                             try:
                                 local_path = Path(local_state).expanduser().resolve()
-                                if runtime.download_file(remote_state, local_path):
+                                if runtime.pull_state_file(remote_state, local_path):
                                     self.log_queue.put(f"[Cloud:{name}] state синхронизирован с сервера\n")
                             except Exception as error:
                                 self.log_queue.put(f"[Cloud:{name}] state не скачан: {error}\n")
                         session["status"] = "done"
-                        code_view = "готово" if exit_code in (0, None) else f"код {exit_code}"
-                        self._cloud_batch_set(name, "готово", code_view)
+                        code_view = "готово" if exit_code == 0 else (
+                            "статус неизвестен" if exit_code is None else f"код {exit_code}"
+                        )
+                        self._cloud_batch_set(
+                            name, "готово" if exit_code == 0 else "ошибка", code_view
+                        )
                         self.log_queue.put(f"[Cloud:{name}] задача завершена ({code_view})\n")
                         try:
                             runtime.close()
@@ -2988,7 +3066,13 @@ class MailerApp:
                             if chunk:
                                 self.log_queue.put(chunk)
                             exit_code = runtime.read_exit_code(task["status_file"])
-                            code = 0 if exit_code is None else exit_code
+                            if exit_code is None:
+                                self.log_queue.put(
+                                    "[Cloud] Сервер не создал exit-status; задачу не считаю успешной.\n"
+                                )
+                                code = 1
+                            else:
+                                code = exit_code
                             break
                         time.sleep(0.35)
                     self._pull_cloud_state(runtime, cmd, remote_cmd)

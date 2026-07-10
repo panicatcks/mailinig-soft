@@ -26,8 +26,14 @@ from typing import Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from email_validator import is_valid_email_syntax
 
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_EMAIL_TOKEN_CHARS = r"A-Za-z0-9.!#$%&'*+/=?^_`{|}~+\-"
+EMAIL_RE = re.compile(
+    rf"(?<![{_EMAIL_TOKEN_CHARS}])"
+    rf"[{_EMAIL_TOKEN_CHARS}]+@[A-Za-z0-9.\-]+\.[A-Za-z]{{2,63}}"
+    rf"(?![{_EMAIL_TOKEN_CHARS}@])"
+)
 TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}")
@@ -156,15 +162,22 @@ class SendingState:
         self.raw_data["sent_today"] = self.sent_today
         self.raw_data["account_sent_today"] = self.account_sent_today
         campaigns = self.raw_data.setdefault("campaigns", {})
+        existing_campaign = campaigns.get(self.campaign_key, {})
+        if not isinstance(existing_campaign, dict):
+            existing_campaign = {}
         campaigns[self.campaign_key] = {
+            **existing_campaign,
             "cursor_index": self.cursor_index,
             "last_row": self.last_row,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(self.raw_data, ensure_ascii=False, indent=2),
+        payload = json.dumps(self.raw_data, ensure_ascii=False, indent=2)
+        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        tmp_path.write_text(
+            payload,
             encoding="utf-8",
         )
+        tmp_path.replace(self.state_path)
 
     def advance_cursor(self, cursor_index: int, source_row: int | None) -> None:
         self.cursor_index = max(cursor_index, 0)
@@ -307,6 +320,11 @@ def parse_args() -> argparse.Namespace:
         help="Файл состояния для суточного лимита.",
     )
     parser.add_argument(
+        "--campaign-key",
+        default="",
+        help="Стабильный ключ кампании (используется GUI для local/cloud state).",
+    )
+    parser.add_argument(
         "--progress-file",
         default="",
         help="JSON-файл статуса выполнения для GUI/облака.",
@@ -446,7 +464,7 @@ def parse_smtp_accounts(args: argparse.Namespace) -> list[SmtpAccount]:
 def extract_emails(text: str) -> list[str]:
     if not text:
         return []
-    return EMAIL_RE.findall(text)
+    return [candidate for candidate in EMAIL_RE.findall(text) if is_valid_email_syntax(candidate)]
 
 
 def parse_kind_filter(raw: str) -> set[str] | None:
@@ -498,7 +516,7 @@ def select_sheet(workbook, sheet_arg: str):
 
 
 def select_sheets(workbook, sheet_arg: str) -> list:
-    """Вернуть список листов для чтения. 'ALL' — все листы книги."""
+    """Return all worksheets for the GUI's ``ALL`` mode."""
     if (sheet_arg or "").strip().upper() == "ALL":
         return list(workbook.worksheets)
     return [select_sheet(workbook, sheet_arg)]
@@ -517,7 +535,17 @@ def load_recipients_from_file(
     ext = path.suffix.lower()
     if ext in {".txt", ".csv"}:
         content = path.read_text(encoding="utf-8", errors="ignore")
-        emails = sorted(set(EMAIL_RE.findall(content)))
+        emails = extract_emails(content)
+        if not allow_duplicate_emails:
+            seen: set[str] = set()
+            unique_emails: list[str] = []
+            for email in emails:
+                key = email.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_emails.append(email)
+            emails = unique_emails
         return [RecipientRow(email=email, fields={}, source_row=None) for email in emails]
 
     if ext != ".xlsx":
@@ -591,7 +619,7 @@ def detect_xlsx_email_columns(path: Path, xlsx_sheet: str, sample_rows: int = 20
             for row in sheet.iter_rows(min_row=1, max_row=sample_rows, values_only=True):
                 for col_idx, value in enumerate(row, start=1):
                     text = to_str(value)
-                    if text and EMAIL_RE.fullmatch(text):
+                    if text and EMAIL_RE.fullmatch(text) and is_valid_email_syntax(text):
                         hits[col_idx] = hits.get(col_idx, 0) + 1
         sorted_hits = sorted(hits.items(), key=lambda item: item[1], reverse=True)
         return [get_column_letter(col_idx) for col_idx, _ in sorted_hits[:5]]
@@ -975,7 +1003,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
     if len(accounts) > 5:
         raise RuntimeError("Можно указать не более 5 SMTP аккаунтов.")
     from_email = accounts[0].from_email
-    campaign_key = build_campaign_key(args, template_path)
+    campaign_key = (args.campaign_key or "").strip() or build_campaign_key(args, template_path)
     state = SendingState(Path(args.state_file).expanduser().resolve(), campaign_key=campaign_key)
     limiter = RateLimiter(args.limit_per_minute)
 
@@ -988,7 +1016,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         for account in accounts
         if account.daily_limit is None or state.account_sent_today.get(account.key, 0) < account.daily_limit
     ]
-    if not active_accounts and not args.dry_run:
+    if not active_accounts:
         wait_text = format_wait_until_midnight()
         raise RuntimeError(f"ratelimit wait {wait_text}")
 
@@ -1069,6 +1097,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
     failed = 0
     skipped_daily = 0
     run_status = "completed"
+    fatal_error: Exception | None = None
     current_account: SmtpAccount | None = None
     smtp: smtplib.SMTP_SSL | None = None
 
@@ -1110,7 +1139,16 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
                 close_smtp()
                 current_account = account
                 print(f"Переключение SMTP аккаунта: {account.display_name}")
-                smtp = connect_account(account)
+                try:
+                    smtp = connect_account(account)
+                except smtplib.SMTPAuthenticationError as error:
+                    fatal_error = error
+                    run_status = "failed"
+                    print(
+                        f"Фатальная ошибка SMTP-авторизации "
+                        f"для {account.display_name}: {error}"
+                    )
+                    break
 
             limiter.wait_for_slot()
             kind = recipient.fields.get("KIND", "")
@@ -1155,13 +1193,32 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
                 except (TimeoutError, smtplib.SMTPServerDisconnected, smtplib.SMTPException) as error:
                     last_error = error
                     print(f"Ошибка отправки ({attempt}/3) для {recipient.email}: {error}")
-                    time.sleep(2)
                     try:
                         if smtp is not None:
                             smtp.quit()
                     except Exception:
                         pass
-                    smtp = connect_account(account)
+                    smtp = None
+                    if isinstance(error, smtplib.SMTPAuthenticationError):
+                        fatal_error = error
+                        run_status = "failed"
+                        break
+                    if attempt < 3:
+                        time.sleep(2)
+                        try:
+                            smtp = connect_account(account)
+                        except smtplib.SMTPAuthenticationError as auth_error:
+                            last_error = auth_error
+                            fatal_error = auth_error
+                            run_status = "failed"
+                            print(
+                                f"Фатальная ошибка SMTP-авторизации "
+                                f"для {account.display_name}: {auth_error}"
+                            )
+                            break
+
+            if fatal_error is not None:
+                break
 
             if last_error:
                 failed += 1
@@ -1225,7 +1282,11 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         skipped=skipped_daily,
         percent=round((final_processed / total_to_process) * 100, 2) if total_to_process else 100,
         account_sent_today=state.account_sent_today,
-        message=f"Готово. Отправлено: {sent}.",
+        message=(
+            f"Фатальная ошибка SMTP: {fatal_error}"
+            if fatal_error is not None
+            else f"Готово. Отправлено: {sent}."
+        ),
     )
 
     run_finished_at = datetime.now()
@@ -1257,6 +1318,9 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
             print("Отчёт рассылки отправлен в Hub.")
         except Exception as error:
             print(f"Не удалось отправить отчёт в Hub: {error}")
+
+    if fatal_error is not None:
+        raise RuntimeError(f"Фатальная ошибка SMTP: {fatal_error}") from fatal_error
 
 
 def main() -> None:
