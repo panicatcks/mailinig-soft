@@ -1016,10 +1016,6 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         for account in accounts
         if account.daily_limit is None or state.account_sent_today.get(account.key, 0) < account.daily_limit
     ]
-    if not active_accounts and not args.dry_run:
-        wait_text = format_wait_until_midnight()
-        raise RuntimeError(f"ratelimit wait {wait_text}")
-
     run_started_at = datetime.now()
     campaign_id = args.campaign_id.strip() or f"cmp-{run_started_at.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     start_cursor = max(state.cursor_index, 0)
@@ -1038,6 +1034,14 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         return
     recipients = recipients[start_cursor:]
     total_to_process = len(recipients)
+    if not active_accounts and not args.dry_run:
+        message = f"Суточный лимит достигнут. Можно продолжить через {format_wait_until_midnight()}."
+        print(f"ℹ {message}")
+        progress.write(
+            status="daily_limit", total=total_to_process, processed=0,
+            sent=0, failed=0, skipped=total_to_process, percent=0, message=message,
+        )
+        return
     print(f"Всего получателей (осталось): {total_to_process}")
     print("SMTP аккаунты:")
     for account in accounts:
@@ -1085,6 +1089,11 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
                 f"  -> {row.email} | subject: {personalized_subject} | "
                 f"template: {row_template_path.name}"
             )
+        progress.write(
+            status="completed", total=total_to_process, processed=0,
+            sent=0, failed=0, skipped=0, percent=0,
+            message="Проверка завершена. Письма не отправлялись.",
+        )
         return
 
     if any(not account.user or not account.password for account in accounts):
@@ -1133,6 +1142,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
                 break
             account = pick_next_account()
             if account is None:
+                run_status = "daily_limit"
                 skipped_daily = len(recipients) - (offset - 1)
                 break
             if current_account is None or current_account.key != account.key:
@@ -1267,7 +1277,7 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
 
     print(f"Готово. Отправлено: {sent}.")
     print(f"Статус выполнения: {run_status}")
-    if skipped_daily:
+    if skipped_daily and run_status == "daily_limit":
         print(
             f"Пропущено из-за суточного лимита: {skipped_daily}. "
             "Запустите снова завтра или увеличьте --limit-per-day."
@@ -1285,6 +1295,8 @@ def send_all(args: argparse.Namespace, recipients: list[RecipientRow], template_
         message=(
             f"Фатальная ошибка SMTP: {fatal_error}"
             if fatal_error is not None
+            else f"Остановлено пользователем. Отправлено: {sent}." if run_status == "stopped"
+            else f"Суточный лимит достигнут. Отправлено: {sent}. Осталось: {skipped_daily}." if run_status == "daily_limit"
             else f"Готово. Отправлено: {sent}."
         ),
     )

@@ -25,6 +25,22 @@ from cloud_runtime import CloudRuntime, ServerConfig
 from self_update import apply_update, check_for_updates
 
 
+def completion_message(code: int | None, payload: dict | None = None) -> str:
+    payload = payload if isinstance(payload, dict) else {}
+    if code is None:
+        return "⚠ Статус завершения неизвестен — проверьте задачу повторно."
+    if code != 0 or payload.get("status") == "failed":
+        return f"❌ Завершено с ошибкой, код {code}."
+    if payload.get("failed", 0):
+        return f"⚠ Завершено с неотправленными письмами: {payload['failed']}. Проверьте журнал."
+    message = payload.get("message") or "Успешно завершено."
+    if payload.get("status") == "stopped":
+        return f"⏹ {message}"
+    if payload.get("status") == "daily_limit":
+        return f"ℹ {message}"
+    return f"✅ {message}"
+
+
 APP_TITLE = "SMTP Рассылка — ПРОМТЕХРЕШЕНИЯ"
 CONFIG_PATH = Path(__file__).resolve().parent / "mailer_gui_config.json"
 PROFILES_PATH = Path(__file__).resolve().parent / "mailer_profiles.json"
@@ -1398,9 +1414,7 @@ class MailerApp:
                             self.log_queue.put(f"[Cloud-clean] Скачан: {local_dest}\n")
                     except Exception as error:
                         self.log_queue.put(f"[Cloud-clean] Не скачан {Path(remote_path).name}: {error}\n")
-                code_view = "ok" if exit_code == 0 else (
-                    "статус неизвестен" if exit_code is None else f"код {exit_code}"
-                )
+                code_view = completion_message(exit_code)
                 files_txt = "\n".join(f"  • {p}" for p in downloaded) or "  (файлы не скачаны)"
                 summary = (
                     f"\nОблачная очистка завершена ({code_view}). Скачано в папку базы:\n{files_txt}"
@@ -2172,7 +2186,7 @@ class MailerApp:
         else:
             self._apply_progress_ui()
         status = str(payload.get("status", "")).lower()
-        if status in {"completed", "stopped", "failed"}:
+        if status in {"completed", "stopped", "failed", "daily_limit"}:
             self._finalize_progress_ui()
 
     def _pull_cloud_state(self, runtime: CloudRuntime, cmd: list[str], remote_cmd: list[str]) -> None:
@@ -2671,8 +2685,7 @@ class MailerApp:
                     self.log_queue.put("[Cloud] Задача все еще выполняется на сервере.\n")
                     self._set_status_async("Облачная задача выполняется")
                 else:
-                    code_view = "unknown" if exit_code is None else str(exit_code)
-                    self.log_queue.put(f"[Cloud] Задача завершена. Код: {code_view}\n")
+                    self.log_queue.put(f"[Cloud] {completion_message(exit_code, payload)}\n")
                     remote_state = task.get("remote_state_file", "")
                     local_state = task.get("local_state_file", "")
                     if remote_state and local_state:
@@ -2850,11 +2863,10 @@ class MailerApp:
                             except Exception as error:
                                 self.log_queue.put(f"[Cloud:{name}] state не скачан: {error}\n")
                         session["status"] = "done"
-                        code_view = "готово" if exit_code == 0 else (
-                            "статус неизвестен" if exit_code is None else f"код {exit_code}"
-                        )
+                        payload = self._read_remote_progress_payload(runtime, task.get("progress_file", ""))
+                        code_view = completion_message(exit_code, payload)
                         self._cloud_batch_set(
-                            name, "готово" if exit_code == 0 else "ошибка", code_view
+                            name, code_view.split(" ", 1)[0], code_view
                         )
                         self.log_queue.put(f"[Cloud:{name}] задача завершена ({code_view})\n")
                         try:
@@ -3076,6 +3088,7 @@ class MailerApp:
                             break
                         time.sleep(0.35)
                     self._pull_cloud_state(runtime, cmd, remote_cmd)
+                    payload = self._read_remote_progress_payload(runtime, task.get("progress_file", ""))
                     self.remote_run_id = None
                     self.remote_task_meta = None
                     self._persist_cloud_last_task()
@@ -3091,10 +3104,12 @@ class MailerApp:
                     for line in self.process.stdout:
                         self.log_queue.put(line)
                     code = self.process.wait()
-                if code == 0:
-                    self.log_queue.put("\n✅ Успешно завершено.\n")
-                else:
-                    self.log_queue.put(f"\n❌ Завершено с ошибкой, код {code}.\n")
+                    try:
+                        payload = json.loads(progress_file_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        payload = None
+                self.log_queue.put(f"\n{completion_message(code, payload)}\n")
+                self.root.after(0, self._finalize_progress_ui)
             except Exception as error:
                 self.log_queue.put(f"\n❌ Ошибка запуска: {error}\n")
             finally:
